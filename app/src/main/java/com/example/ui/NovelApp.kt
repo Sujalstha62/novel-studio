@@ -202,10 +202,12 @@ fun NovelApp(
     val activeTab by viewModel.activeTab.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val currentTexture = getTextureByName(settings.selectedTexture)
-    val syncStatus by viewModel.syncStatus.collectAsState()
-    val syncTimeText by viewModel.lastSyncedTimeText.collectAsState()
+    val isSavingLocally by viewModel.isSavingLocally.collectAsState()
+    val lastSavedTimeText by viewModel.lastSavedTimeText.collectAsState()
     val selectedNodeId by viewModel.selectedNodeId.collectAsState()
     val activeNode by viewModel.activeNode.collectAsState()
+    val proposedChanges by viewModel.proposedChanges.collectAsState()
+    val showReviewDialog by viewModel.showReviewDialog.collectAsState()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
@@ -328,13 +330,13 @@ fun NovelApp(
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.CloudDone, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                            Icon(Icons.Outlined.Storage, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text(text = "Status: Online", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                            Text(text = "Local Storage: Active", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
                         }
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = syncTimeText,
+                            text = lastSavedTimeText,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                         )
@@ -378,7 +380,19 @@ fun NovelApp(
                     }
                 }
 
-                // Sync Status Overlay Indicator (Floating pill on top right)
+                // AI Story Proposed Changes Review Dialog
+                if (showReviewDialog && proposedChanges.isNotEmpty()) {
+                    StoryReviewDialog(
+                        changes = proposedChanges,
+                        onAcceptChange = { viewModel.acceptProposedChange(it) },
+                        onRejectChange = { viewModel.rejectProposedChange(it) },
+                        onAcceptAll = { viewModel.acceptAllProposedChanges() },
+                        onRejectAll = { viewModel.rejectAllProposedChanges() },
+                        onDismiss = { viewModel.dismissReviewDialog() }
+                    )
+                }
+
+                // Local Save Indicator (Unobtrusive floating pill on top right)
                 if (selectedNodeId == null || !settings.isDistractionFree) {
                     Box(
                         modifier = Modifier
@@ -386,7 +400,7 @@ fun NovelApp(
                             .padding(top = 16.dp, end = 16.dp)
                     ) {
                         AnimatedVisibility(
-                            visible = syncStatus == SyncStatus.SYNCING || syncStatus == SyncStatus.SUCCESS,
+                            visible = isSavingLocally,
                             enter = fadeIn() + slideInVertically(),
                             exit = fadeOut() + slideOutVertically()
                         ) {
@@ -402,32 +416,17 @@ fun NovelApp(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    if (syncStatus == SyncStatus.SYNCING) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(12.dp),
-                                            strokeWidth = 2.dp,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
-                                        Text(
-                                            text = "Syncing cloud...",
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.onPrimaryContainer
-                                        )
-                                    } else if (syncStatus == SyncStatus.SUCCESS) {
-                                        Icon(
-                                            Icons.Default.CloudDone,
-                                            contentDescription = "Synced",
-                                            tint = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(14.dp)
-                                        )
-                                        Text(
-                                            text = "Cloud Synced",
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.onPrimaryContainer
-                                        )
-                                    }
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(12.dp),
+                                        strokeWidth = 2.dp,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        text = "Saving locally...",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                                    )
                                 }
                             }
                         }
@@ -445,16 +444,28 @@ fun NovelApp(
 @Composable
 fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
     val allNodes by viewModel.allNodes.collectAsState()
+    val rootNovels by viewModel.rootNovels.collectAsState()
+    val selectedNovelId by viewModel.selectedNovelId.collectAsState()
+
     var showCreateDialog by remember { mutableStateOf<Pair<Boolean, Boolean>?>(null) } // Pair(isFolder, parentId?)
+    var showCreateNovelDialog by remember { mutableStateOf(false) }
     var selectedParentIdForNew by remember { mutableStateOf<Int?>(null) }
     var activeFolderId by remember { mutableStateOf<Int?>(null) } // folder filter to drill down
+    var nodePendingDeletion by remember { mutableStateOf<ManuscriptNode?>(null) }
+    var showNovelDropdown by remember { mutableStateOf(false) }
 
-    val currentNodes = remember(allNodes, activeFolderId) {
-        allNodes.filter { it.parentId == activeFolderId }
+    val activeNovel = remember(rootNovels, selectedNovelId) {
+        rootNovels.find { it.id == selectedNovelId }
     }
 
-    val activeFolderName = remember(allNodes, activeFolderId) {
-        if (activeFolderId == null) "Manuscript Root"
+    val currentNodes = remember(allNodes, activeFolderId, selectedNovelId) {
+        val targetParent = activeFolderId ?: selectedNovelId
+        if (targetParent == null) emptyList()
+        else allNodes.filter { it.parentId == targetParent }
+    }
+
+    val activeFolderName = remember(allNodes, activeFolderId, activeNovel) {
+        if (activeFolderId == null) activeNovel?.name ?: "No Novel Selected"
         else allNodes.find { it.id == activeFolderId }?.name ?: "Folder"
     }
 
@@ -470,12 +481,12 @@ fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Uni
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (activeFolderId != null) {
                         IconButton(onClick = {
                             val parentFolder = allNodes.find { it.id == activeFolderId }?.parentId
-                            activeFolderId = parentFolder
+                            activeFolderId = if (parentFolder == selectedNovelId) null else parentFolder
                         }) {
                             Icon(Icons.Default.ArrowBack, contentDescription = "Go back")
                         }
@@ -489,14 +500,104 @@ fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Uni
                         text = activeFolderName,
                         style = MaterialTheme.typography.headlineMedium,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onBackground
+                        color = MaterialTheme.colorScheme.onBackground,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
-                Text(
-                    text = "Organize chapters, outlines, and world-building notes.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
-                )
+
+                // Novel Switcher Chip / Selector
+                if (activeFolderId == null) {
+                    Box(modifier = Modifier.padding(start = 12.dp, top = 2.dp)) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                            modifier = Modifier.clickable { showNovelDropdown = true }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Outlined.AutoStories,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Novel: ${activeNovel?.name ?: "Select Novel"}",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Icon(
+                                    Icons.Default.ArrowDropDown,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+
+                        DropdownMenu(
+                            expanded = showNovelDropdown,
+                            onDismissRequest = { showNovelDropdown = false }
+                        ) {
+                            rootNovels.forEach { novel ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            novel.name,
+                                            fontWeight = if (novel.id == selectedNovelId) FontWeight.Bold else FontWeight.Normal
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Book,
+                                            contentDescription = null,
+                                            tint = if (novel.id == selectedNovelId) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    },
+                                    onClick = {
+                                        viewModel.selectNovel(novel.id)
+                                        activeFolderId = null
+                                        showNovelDropdown = false
+                                    }
+                                )
+                            }
+                            Divider()
+                            DropdownMenuItem(
+                                text = { Text("+ Create New Novel", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold) },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                },
+                                onClick = {
+                                    showNovelDropdown = false
+                                    showCreateNovelDialog = true
+                                }
+                            )
+                        }
+                    }
+                } else {
+                    Text(
+                        text = "Viewing contents of subfolder inside ${activeNovel?.name ?: "Novel"}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+                        modifier = Modifier.padding(start = 12.dp)
+                    )
+                }
+            }
+
+            // Button to Add a New Root Novel directly from header
+            if (activeFolderId == null) {
+                IconButton(
+                    onClick = { showCreateNovelDialog = true },
+                    modifier = Modifier.testTag("create_novel_header_button")
+                ) {
+                    Icon(Icons.Default.LibraryAdd, contentDescription = "Create New Novel", tint = MaterialTheme.colorScheme.primary)
+                }
             }
         }
 
@@ -510,8 +611,9 @@ fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Uni
             Button(
                 onClick = {
                     showCreateDialog = Pair(false, false) // Chapter (File)
-                    selectedParentIdForNew = activeFolderId
+                    selectedParentIdForNew = activeFolderId ?: selectedNovelId
                 },
+                enabled = selectedNovelId != null,
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier
                     .weight(1f)
@@ -525,8 +627,9 @@ fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Uni
             OutlinedButton(
                 onClick = {
                     showCreateDialog = Pair(true, true) // Folder
-                    selectedParentIdForNew = activeFolderId
+                    selectedParentIdForNew = activeFolderId ?: selectedNovelId
                 },
+                enabled = selectedNovelId != null,
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier
                     .weight(1f)
@@ -541,7 +644,52 @@ fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Uni
         Spacer(modifier = Modifier.height(16.dp))
 
         // Files List
-        if (currentNodes.isEmpty()) {
+        if (selectedNovelId == null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .clip(RoundedCornerShape(16.dp))
+                    .border(1.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f), RoundedCornerShape(16.dp))
+                    .background(MaterialTheme.colorScheme.surface),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(24.dp)
+                ) {
+                    Icon(
+                        Icons.Outlined.AutoStories,
+                        contentDescription = null,
+                        modifier = Modifier.size(64.dp),
+                        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "No Novel Created Yet",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Start a new novel project to organize your manuscript, character arcs, and storylines.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(
+                        onClick = { showCreateNovelDialog = true },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.testTag("create_first_novel_button")
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Create Novel")
+                    }
+                }
+            }
+        } else if (currentNodes.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -563,13 +711,13 @@ fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Uni
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "This folder is empty",
+                        text = if (activeFolderId != null) "This folder is empty" else "No chapters in this novel yet",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Create a folder or a new writing file to get started.",
+                        text = "Create a chapter or a folder above to start writing.",
                         style = MaterialTheme.typography.bodyMedium,
                         textAlign = TextAlign.Center,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
@@ -588,7 +736,7 @@ fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Uni
                         node = node,
                         onSelectFile = { viewModel.selectNode(it.id) },
                         onSelectFolder = { activeFolderId = it.id },
-                        onDelete = { viewModel.deleteNode(it) },
+                        onDelete = { nodePendingDeletion = it },
                         onRename = { id, name -> viewModel.renameNode(id, name) }
                     )
                 }
@@ -642,10 +790,11 @@ fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Uni
                         Button(
                             onClick = {
                                 if (inputName.isNotBlank()) {
+                                    val parent = selectedParentIdForNew ?: activeFolderId ?: selectedNovelId
                                     if (isFolder) {
-                                        viewModel.createFolder(inputName, selectedParentIdForNew)
+                                        viewModel.createFolder(inputName, parent)
                                     } else {
-                                        viewModel.createFile(inputName, selectedParentIdForNew)
+                                        viewModel.createFile(inputName, parent)
                                     }
                                     showCreateDialog = null
                                 }
@@ -659,6 +808,133 @@ fun ManuscriptWorkspaceScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Uni
                 }
             }
         }
+    }
+
+    // Modal Dialog to Create a Root Novel
+    if (showCreateNovelDialog) {
+        var novelNameInput by remember { mutableStateOf("") }
+        Dialog(onDismissRequest = { showCreateNovelDialog = false }) {
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+                    .shadow(12.dp, RoundedCornerShape(16.dp))
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "Create New Novel",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "This sets up a dedicated novel project with its own characters, chapters, and storylines.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    OutlinedTextField(
+                        value = novelNameInput,
+                        onValueChange = { novelNameInput = it },
+                        label = { Text("Novel Title") },
+                        placeholder = { Text("The Silent Archipelago...") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("create_novel_input")
+                    )
+                    Spacer(modifier = Modifier.height(20.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = { showCreateNovelDialog = false }) {
+                            Text("Cancel")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                if (novelNameInput.isNotBlank()) {
+                                    viewModel.createNovel(novelNameInput)
+                                    showCreateNovelDialog = false
+                                }
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.testTag("confirm_create_novel_button")
+                        ) {
+                            Text("Create Novel")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Safe Deletion Confirmation Dialog
+    if (nodePendingDeletion != null) {
+        val node = nodePendingDeletion!!
+        val isRootNovel = node.parentId == null && node.isFolder
+
+        AlertDialog(
+            onDismissRequest = { nodePendingDeletion = null },
+            icon = {
+                Icon(
+                    Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(32.dp)
+                )
+            },
+            title = {
+                Text(
+                    text = if (isRootNovel) "Delete Entire Novel?"
+                    else if (node.isFolder) "Delete Folder & All Contents?"
+                    else "Delete Chapter Draft?",
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Text(
+                    text = if (isRootNovel) {
+                        "Are you sure you want to permanently delete the novel \"${node.name}\"?\n\nThis will safely and permanently remove all chapters, subfolders, characters, plot events, and relationships associated with this novel. This action cannot be undone."
+                    } else if (node.isFolder) {
+                        "Are you sure you want to delete folder \"${node.name}\"?\n\nAll nested chapters and subfolders inside this folder will be permanently deleted. This action cannot be undone."
+                    } else {
+                        "Are you sure you want to delete chapter \"${node.name}\"? This draft will be permanently removed."
+                    }
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.deleteNode(node)
+                        nodePendingDeletion = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.testTag("confirm_delete_button")
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = { nodePendingDeletion = null },
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.testTag("cancel_delete_button")
+                ) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
@@ -863,6 +1139,28 @@ fun NovelEditorScreen(viewModel: NovelViewModel) {
 
                             // Toolbar Action Buttons
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                // Analyze Story Button
+                                val isAnalyzingStory by viewModel.isAnalyzingStory.collectAsState()
+                                IconButton(
+                                    onClick = { activeNode?.let { viewModel.requestAIStoryAnalysis(it.id) } },
+                                    enabled = activeNode != null && !isAnalyzingStory,
+                                    modifier = Modifier.testTag("analyze_story_button")
+                                ) {
+                                    if (isAnalyzingStory) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(18.dp),
+                                            strokeWidth = 2.dp,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    } else {
+                                        Icon(
+                                            Icons.Default.AutoAwesome,
+                                            contentDescription = "Analyze Story",
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+
                                 // Toggle Right Workspace Utilities Sidebar
                                 IconButton(
                                     onClick = { isSidebarOpen = !isSidebarOpen },
@@ -881,6 +1179,41 @@ fun NovelEditorScreen(viewModel: NovelViewModel) {
                                     modifier = Modifier.testTag("distraction_free_toggle")
                                 ) {
                                     Icon(Icons.Default.Fullscreen, contentDescription = "Distraction-Free Mode")
+                                }
+                            }
+                        }
+                    }
+
+                    // Analysis Status Message Banner
+                    val statusMsg by viewModel.analysisStatusMessage.collectAsState()
+                    if (statusMsg != null) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 4.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = statusMsg!!,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                IconButton(
+                                    onClick = { viewModel.clearAnalysisStatusMessage() },
+                                    modifier = Modifier.size(24.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.Close,
+                                        contentDescription = "Dismiss",
+                                        modifier = Modifier.size(16.dp)
+                                    )
                                 }
                             }
                         }
@@ -1119,7 +1452,7 @@ fun NovelEditorScreen(viewModel: NovelViewModel) {
                                 }
                             }
 
-                            // 1.5 AI Story Auto-Tracker Section
+                            // 1.5 AI Story Tracker Section
                             item {
                                 val isAnalyzingStory by viewModel.isAnalyzingStory.collectAsState()
                                 Card(
@@ -1141,11 +1474,11 @@ fun NovelEditorScreen(viewModel: NovelViewModel) {
                                                     modifier = Modifier.size(18.dp)
                                                 )
                                                 Spacer(modifier = Modifier.width(6.dp))
-                                                Text("AI Story Agent", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                                                Text("Story Analysis", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
                                             }
                                             
                                             Button(
-                                                onClick = { activeNode?.let { viewModel.runAIStoryAnalysis(it.id) } },
+                                                onClick = { activeNode?.let { viewModel.requestAIStoryAnalysis(it.id) } },
                                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                                                 shape = RoundedCornerShape(8.dp),
                                                 modifier = Modifier.height(32.dp).testTag("ai_story_analysis_button"),
@@ -1155,7 +1488,7 @@ fun NovelEditorScreen(viewModel: NovelViewModel) {
                                                 if (isAnalyzingStory) {
                                                     CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onSecondary)
                                                 } else {
-                                                    Text("Auto-Scan", style = MaterialTheme.typography.labelSmall)
+                                                    Text("Analyze Story", style = MaterialTheme.typography.labelSmall)
                                                 }
                                             }
                                         }
@@ -1163,7 +1496,7 @@ fun NovelEditorScreen(viewModel: NovelViewModel) {
                                         Spacer(modifier = Modifier.height(8.dp))
 
                                         Text(
-                                            text = "Automatically extract characters, plot event milestones, and map narrative relationships under the corresponding novel folder.",
+                                            text = "Scan chapter to extract characters, milestones, and relationships. All proposed changes are presented for your review before saving to the database.",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                                         )
@@ -1463,9 +1796,7 @@ fun CharactersManagerScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit)
     val characters by viewModel.filteredCharacters.collectAsState()
     val editingCharacter by viewModel.editingCharacter.collectAsState()
     val selectedNovelId by viewModel.selectedNovelId.collectAsState()
-    val allNodes by viewModel.allNodes.collectAsState()
-
-    val novels = remember(allNodes) { allNodes.filter { it.isFolder } }
+    val novels by viewModel.rootNovels.collectAsState()
     val activeNovel = remember(novels, selectedNovelId) { novels.find { it.id == selectedNovelId } }
     var showDropdown by remember { mutableStateOf(false) }
 
@@ -1939,9 +2270,31 @@ fun CharacterDetailEditor(
 @Composable
 fun ExporterScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
     val allNodes by viewModel.allNodes.collectAsState()
+    val rootNovels by viewModel.rootNovels.collectAsState()
+    val selectedNovelId by viewModel.selectedNovelId.collectAsState()
     val context = LocalContext.current
+
     var selectedFormat by remember { mutableStateOf("Standard Manuscript (TXT)") }
     var selectedExportNodeId by remember { mutableStateOf<Int?>(null) } // null means Entire Book
+    var showNovelDropdown by remember { mutableStateOf(false) }
+    var showChapterDropdown by remember { mutableStateOf(false) }
+
+    val activeNovel = remember(rootNovels, selectedNovelId) {
+        rootNovels.find { it.id == selectedNovelId }
+    }
+
+    val availableChapters = remember(allNodes, selectedNovelId) {
+        val currentNovelId = selectedNovelId
+        if (currentNovelId == null) {
+            allNodes.filter { !it.isFolder }
+        } else {
+            fun getDescendants(parentId: Int): List<ManuscriptNode> {
+                val direct = allNodes.filter { it.parentId == parentId }
+                return direct.flatMap { if (it.isFolder) getDescendants(it.id) else listOf(it) }
+            }
+            getDescendants(currentNovelId)
+        }
+    }
 
     val formats = listOf(
         "Standard Manuscript (TXT)" to "Standard industry layout with double-spaced typography formatting.",
@@ -1985,9 +2338,60 @@ fun ExporterScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                 .shadow(2.dp, RoundedCornerShape(16.dp))
         ) {
             Column(modifier = Modifier.padding(18.dp)) {
+                // Novel Selector
+                Text(
+                    text = "Target Novel",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedCard(
+                        onClick = { showNovelDropdown = true },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Book, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = activeNovel?.name ?: "Select Novel",
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                            Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                        }
+                    }
+
+                    DropdownMenu(
+                        expanded = showNovelDropdown,
+                        onDismissRequest = { showNovelDropdown = false }
+                    ) {
+                        rootNovels.forEach { novel ->
+                            DropdownMenuItem(
+                                text = { Text(novel.name) },
+                                onClick = {
+                                    viewModel.selectNovel(novel.id)
+                                    selectedExportNodeId = null
+                                    showNovelDropdown = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
                 // Select Node to export
                 Text(
-                    text = "Export Target",
+                    text = "Export Scope",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
@@ -2017,7 +2421,7 @@ fun ExporterScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            "Entire Book Outline",
+                            "Entire Novel",
                             fontWeight = FontWeight.Bold,
                             fontSize = 12.sp,
                             color = if (selectedExportNodeId == null) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
@@ -2039,8 +2443,9 @@ fun ExporterScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                                 RoundedCornerShape(12.dp)
                             )
                             .clickable {
-                                val firstChapter = allNodes.find { !it.isFolder }
-                                selectedExportNodeId = firstChapter?.id
+                                if (selectedExportNodeId == null) {
+                                    selectedExportNodeId = availableChapters.firstOrNull()?.id
+                                }
                             }
                             .padding(vertical = 14.dp),
                         contentAlignment = Alignment.Center
@@ -2054,14 +2459,55 @@ fun ExporterScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                     }
                 }
 
+                // If Selected Chapter scope is chosen, allow picking from chapter list
                 if (selectedExportNodeId != null) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text = "Active file: " + (allNodes.find { it.id == selectedExportNodeId }?.name ?: "Select draft"),
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        OutlinedCard(
+                            onClick = { showChapterDropdown = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                val currentChapterName = allNodes.find { it.id == selectedExportNodeId }?.name ?: "Choose Chapter"
+                                Text(
+                                    text = "Chapter: $currentChapterName",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Icon(Icons.Default.ArrowDropDown, contentDescription = null, modifier = Modifier.size(16.dp))
+                            }
+                        }
+
+                        DropdownMenu(
+                            expanded = showChapterDropdown,
+                            onDismissRequest = { showChapterDropdown = false }
+                        ) {
+                            if (availableChapters.isEmpty()) {
+                                DropdownMenuItem(
+                                    text = { Text("No chapters found in this novel") },
+                                    onClick = { showChapterDropdown = false }
+                                )
+                            } else {
+                                availableChapters.forEach { chapter ->
+                                    DropdownMenuItem(
+                                        text = { Text(chapter.name) },
+                                        onClick = {
+                                            selectedExportNodeId = chapter.id
+                                            showChapterDropdown = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(20.dp))
@@ -2079,21 +2525,21 @@ fun ExporterScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(vertical = 6.dp)
+                            .padding(vertical = 4.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(
                                 if (isSelected) MaterialTheme.colorScheme.surfaceVariant
                                 else Color.Transparent
                             )
                             .clickable { selectedFormat = formatName }
-                            .padding(12.dp),
+                            .padding(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         RadioButton(
                             selected = isSelected,
                             onClick = { selectedFormat = formatName }
                         )
-                        Spacer(modifier = Modifier.width(12.dp))
+                        Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(
                                 text = formatName,
@@ -2109,15 +2555,15 @@ fun ExporterScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                     }
                 }
 
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.height(20.dp))
 
                 Button(
                     onClick = {
-                        val uri = viewModel.exportManuscript(context, selectedFormat, selectedExportNodeId)
+                        val uri = viewModel.exportManuscript(context, selectedFormat, selectedExportNodeId, selectedNovelId)
                         if (uri != null) {
-                            Toast.makeText(context, "Manuscript file compiled successfully!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Manuscript compiled and ready to share!", Toast.LENGTH_SHORT).show()
                         } else {
-                            Toast.makeText(context, "Select a valid draft file to export.", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Please ensure a valid novel or chapter is available to export.", Toast.LENGTH_SHORT).show()
                         }
                     },
                     shape = RoundedCornerShape(12.dp),
@@ -2142,8 +2588,7 @@ fun ExporterScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
 fun SettingsScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
     val settings by viewModel.settings.collectAsState()
     val selectedFont by viewModel.selectedFont.collectAsState()
-    val scope = rememberCoroutineScope()
-    val context = LocalContext.current
+    val lastSavedTimeText by viewModel.lastSavedTimeText.collectAsState()
 
     Column(
         modifier = Modifier
@@ -2163,170 +2608,230 @@ fun SettingsScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "Configure backups, editing profiles, and manuscript styles.",
+                    text = "Configure storage, analysis modes, and typography.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(20.dp))
 
-        Card(
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            modifier = Modifier
-                .fillMaxWidth()
-                .shadow(2.dp, RoundedCornerShape(16.dp))
-        ) {
-            Column(modifier = Modifier.padding(18.dp)) {
-                Text(
-                    text = "Cloud Synchronization",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "Maintain real-time secure copies of all chapters.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                )
-
-                Spacer(modifier = Modifier.height(14.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            // Storage & Synchronization Card
+            item {
+                Card(
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .shadow(2.dp, RoundedCornerShape(16.dp))
                 ) {
-                    Column {
-                        Text("Automatic Syncing", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                        Text("Sync draft saves to cloud database automatically.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
-                    }
-                    Switch(
-                        checked = settings.isAutoSyncEnabled,
-                        onCheckedChange = { viewModel.setAutoSyncEnabled(it) }
-                    )
-                }
+                    Column(modifier = Modifier.padding(18.dp)) {
+                        Text(
+                            text = "Storage & Synchronization",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Local offline storage active. All data safely saved on this device.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                        )
 
-                Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
 
-                Button(
-                    onClick = {
-                        scope.launch {
-                            viewModel.triggerSync()
-                            Toast.makeText(context, "Forced Cloud Backup Complete!", Toast.LENGTH_SHORT).show()
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(14.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Outlined.Storage, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Local SQLite Storage: Active", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                }
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = lastSavedTimeText,
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "Manuscripts, characters, story events, and drafts are permanently stored locally using Room persistence.",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                                )
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Outlined.CloudOff, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Cloud Sync: Not Configured", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f), fontWeight = FontWeight.SemiBold)
+                                }
+                            }
                         }
-                    },
-                    shape = RoundedCornerShape(12.dp),
+                    }
+                }
+            }
+
+            // AI Story Analysis Mode Card
+            item {
+                Card(
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("force_sync_button")
+                        .shadow(2.dp, RoundedCornerShape(16.dp))
                 ) {
-                    Icon(Icons.Default.CloudUpload, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Sync Manuscripts Now")
+                    Column(modifier = Modifier.padding(18.dp)) {
+                        Text(
+                            text = "AI Narrative Analysis Mode",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Control how and when Gemini analyzes chapter text.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                        )
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Automatic Background Analysis", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                Text(
+                                    text = "When enabled, analyzes text after typing pauses. (Default is OFF — manual 'Analyze Story' button is recommended).",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Switch(
+                                checked = settings.isAutoAnalysisEnabled,
+                                onCheckedChange = { viewModel.setAutoAnalysisEnabled(it) },
+                                modifier = Modifier.testTag("auto_analysis_switch")
+                            )
+                        }
+                    }
                 }
+            }
 
-                Spacer(modifier = Modifier.height(20.dp))
-                Divider()
-                Spacer(modifier = Modifier.height(20.dp))
-
-                Text(
-                    text = "Editor Typographic Scale",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "Adjust standard text rendering size.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                )
-
-                Spacer(modifier = Modifier.height(14.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
+            // Typography Card
+            item {
+                Card(
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .shadow(2.dp, RoundedCornerShape(16.dp))
                 ) {
-                    Text("A-", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    Slider(
-                        value = settings.fontSize.toFloat(),
-                        onValueChange = { viewModel.updateFontSize(it.toInt()) },
-                        valueRange = 14f..24f,
-                        steps = 5,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Text("A+", fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                }
+                    Column(modifier = Modifier.padding(18.dp)) {
+                        Text(
+                            text = "Editor Typographic Scale",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Adjust standard text rendering size.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                        )
 
-                Spacer(modifier = Modifier.height(20.dp))
-                Divider()
-                Spacer(modifier = Modifier.height(20.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
 
-                Text(
-                    text = "Manuscript Typeface",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "Select your preferred storytelling font style.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-                )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("A-", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Slider(
+                                value = settings.fontSize.toFloat(),
+                                onValueChange = { viewModel.updateFontSize(it.toInt()) },
+                                valueRange = 14f..24f,
+                                steps = 5,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text("A+", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        }
 
-                Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(20.dp))
+                        Divider()
+                        Spacer(modifier = Modifier.height(20.dp))
 
-                val fonts = listOf("Classic Serif", "Modern Sans-Serif", "Retro Monospace", "Dyslexic-Friendly")
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    fonts.take(2).forEach { font ->
-                        FilterChip(
-                            selected = selectedFont == font,
-                            onClick = { viewModel.updateSelectedFont(font) },
-                            label = { Text(font, style = MaterialTheme.typography.bodyMedium) },
-                            modifier = Modifier.weight(1f)
+                        Text(
+                            text = "Manuscript Typeface",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Select your preferred storytelling font style.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        val fonts = listOf("Classic Serif", "Modern Sans-Serif", "Retro Monospace", "Dyslexic-Friendly")
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            fonts.take(2).forEach { font ->
+                                FilterChip(
+                                    selected = selectedFont == font,
+                                    onClick = { viewModel.updateSelectedFont(font) },
+                                    label = { Text(font, style = MaterialTheme.typography.bodyMedium) },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            fonts.drop(2).forEach { font ->
+                                FilterChip(
+                                    selected = selectedFont == font,
+                                    onClick = { viewModel.updateSelectedFont(font) },
+                                    label = { Text(font, style = MaterialTheme.typography.bodyMedium) },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+
+                        val previewFontFamily = when (selectedFont) {
+                            "Classic Serif" -> FontFamily.Serif
+                            "Modern Sans-Serif" -> FontFamily.SansSerif
+                            "Retro Monospace" -> FontFamily.Monospace
+                            "Dyslexic-Friendly" -> FontFamily.Cursive
+                            else -> FontFamily.Default
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Text(
+                            text = "Visual Preview: ${settings.fontSize}sp under $selectedFont style.",
+                            fontSize = settings.fontSize.sp,
+                            fontFamily = previewFontFamily,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .padding(12.dp)
                         )
                     }
                 }
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    fonts.drop(2).forEach { font ->
-                        FilterChip(
-                            selected = selectedFont == font,
-                            onClick = { viewModel.updateSelectedFont(font) },
-                            label = { Text(font, style = MaterialTheme.typography.bodyMedium) },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                }
-
-                val previewFontFamily = when (selectedFont) {
-                    "Classic Serif" -> FontFamily.Serif
-                    "Modern Sans-Serif" -> FontFamily.SansSerif
-                    "Retro Monospace" -> FontFamily.Monospace
-                    "Dyslexic-Friendly" -> FontFamily.Cursive
-                    else -> FontFamily.Default
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Text(
-                    text = "Visual Preview: ${settings.fontSize}sp under $selectedFont style.",
-                    fontSize = settings.fontSize.sp,
-                    fontFamily = previewFontFamily,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                        .padding(12.dp)
-                )
             }
         }
     }

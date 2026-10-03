@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Dedicated cache directory for exported manuscripts, preventing exposure of arbitrary private files -->
+    <cache-path name="novel_exports" path="exports/" />
+</paths>

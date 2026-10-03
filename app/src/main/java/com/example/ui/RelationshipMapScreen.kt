@@ -47,8 +47,7 @@ fun RelationshipMapScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
         topBar = {
             TopAppBar(
                 title = {
-                    val allNodes by viewModel.allNodes.collectAsState()
-                    val novels = remember(allNodes) { allNodes.filter { it.isFolder } }
+                    val novels by viewModel.rootNovels.collectAsState()
                     val activeNovel = remember(novels, selectedNovelId) { novels.find { it.id == selectedNovelId } }
                     var showDropdown by remember { mutableStateOf(false) }
 

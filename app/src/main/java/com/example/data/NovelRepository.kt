@@ -1,9 +1,12 @@
 package com.example.data
 
+import androidx.room.withTransaction
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.firstOrNull
+import java.util.ArrayDeque
 
 class NovelRepository(
+    private val database: AppDatabase,
     private val manuscriptDao: ManuscriptDao,
     private val characterDao: CharacterDao,
     private val settingsDao: SettingsDao,
@@ -18,20 +21,69 @@ class NovelRepository(
     val allRelationships: Flow<List<CharacterRelationship>> = characterRelationshipDao.getAllRelationshipsFlow()
     val allCommits: Flow<List<ManuscriptCommit>> = manuscriptCommitDao.getAllCommitsFlow()
 
+    fun getCharactersByNovelFlow(novelId: Int): Flow<List<CharacterProfile>> =
+        characterDao.getCharactersByNovelFlow(novelId)
+
+    fun getEventsByNovelFlow(novelId: Int): Flow<List<StoryEvent>> =
+        storyEventDao.getEventsByNovelFlow(novelId)
+
+    fun getRelationshipsByNovelFlow(novelId: Int): Flow<List<CharacterRelationship>> =
+        characterRelationshipDao.getRelationshipsByNovelFlow(novelId)
+
     fun getNodeByIdFlow(id: Int): Flow<ManuscriptNode?> = manuscriptDao.getNodeByIdFlow(id)
     suspend fun getNodeById(id: Int): ManuscriptNode? = manuscriptDao.getNodeById(id)
 
     suspend fun insertNode(node: ManuscriptNode): Long = manuscriptDao.insertNode(node)
     suspend fun updateNode(node: ManuscriptNode) = manuscriptDao.updateNode(node)
-    suspend fun deleteNode(node: ManuscriptNode) = manuscriptDao.deleteNode(node)
-    suspend fun deleteNodeById(id: Int) = manuscriptDao.deleteNodeById(id)
+    suspend fun updateLastAnalyzedHash(nodeId: Int, hash: String?) = manuscriptDao.updateLastAnalyzedHash(nodeId, hash)
+
+    /**
+     * Recursively and safely deletes a manuscript node (and all its nested descendants).
+     * If the node is a root novel folder (parentId == null && isFolder == true),
+     * this transaction atomically cleans up all associated characters, plot events,
+     * and relationships belonging to the novel, leaving no orphaned data.
+     */
+    suspend fun deleteNodeRecursively(node: ManuscriptNode) {
+        database.withTransaction {
+            val allExistingNodes = manuscriptDao.getAllNodesList()
+            val nodesToDelete = mutableListOf<Int>()
+            val queue = ArrayDeque<Int>()
+            queue.add(node.id)
+
+            while (queue.isNotEmpty()) {
+                val currentId = queue.poll()
+                nodesToDelete.add(currentId)
+                val children = allExistingNodes.filter { it.parentId == currentId }
+                for (child in children) {
+                    if (!nodesToDelete.contains(child.id)) {
+                        queue.add(child.id)
+                    }
+                }
+            }
+
+            // 1. Delete all commits for all descendant nodes
+            if (nodesToDelete.isNotEmpty()) {
+                manuscriptCommitDao.deleteCommitsForNodes(nodesToDelete)
+                manuscriptDao.deleteNodesByIds(nodesToDelete)
+            }
+
+            // 2. If deleting an entire novel (root-level folder), cascade clean its novel-specific data
+            val isRootNovel = node.parentId == null && node.isFolder
+            if (isRootNovel) {
+                characterRelationshipDao.deleteRelationshipsByNovel(node.id)
+                characterDao.deleteCharactersByNovel(node.id)
+                storyEventDao.deleteEventsByNovel(node.id)
+            }
+        }
+    }
 
     suspend fun getCharacterById(id: Int): CharacterProfile? = characterDao.getCharacterById(id)
     suspend fun insertCharacter(character: CharacterProfile): Long = characterDao.insertCharacter(character)
     suspend fun deleteCharacter(character: CharacterProfile) {
-        // clean up relationships
-        characterRelationshipDao.deleteRelationshipsForCharacter(character.id)
-        characterDao.deleteCharacter(character)
+        database.withTransaction {
+            characterRelationshipDao.deleteRelationshipsForCharacter(character.id)
+            characterDao.deleteCharacter(character)
+        }
     }
 
     suspend fun getSettings(): WritingSettings? = settingsDao.getSettings()
@@ -46,14 +98,31 @@ class NovelRepository(
     suspend fun insertEvent(event: StoryEvent): Long = storyEventDao.insertEvent(event)
     suspend fun updateEvent(event: StoryEvent) = storyEventDao.updateEvent(event)
     suspend fun deleteEvent(event: StoryEvent) {
-        characterRelationshipDao.deleteRelationshipsForEvent(event.id)
-        storyEventDao.deleteEvent(event)
+        database.withTransaction {
+            characterRelationshipDao.deleteRelationshipsForEvent(event.id)
+            storyEventDao.deleteEvent(event)
+        }
     }
 
     // Relationships
     suspend fun insertRelationship(relationship: CharacterRelationship) = characterRelationshipDao.insertRelationship(relationship)
     suspend fun deleteRelationship(relationship: CharacterRelationship) = characterRelationshipDao.deleteRelationship(relationship)
-    suspend fun deleteRelationshipsForCharacter(charId: Int) = characterRelationshipDao.deleteRelationshipsForCharacter(charId)
+
+    /**
+     * Repairs any legacy or seeded records where novelId was null, associating them
+     * with the default root novel so they are not orphaned.
+     */
+    suspend fun repairMissingNovelAssociations() {
+        val allNodesList = manuscriptDao.getAllNodesList()
+        val defaultNovel = allNodesList.firstOrNull { it.parentId == null && it.isFolder }
+        if (defaultNovel != null) {
+            database.withTransaction {
+                characterDao.updateMissingNovelId(defaultNovel.id)
+                storyEventDao.updateMissingNovelId(defaultNovel.id)
+                characterRelationshipDao.updateMissingNovelId(defaultNovel.id)
+            }
+        }
+    }
 
     suspend fun seedInitialDataIfEmpty() {
         // Seed default settings if not exists
@@ -63,17 +132,20 @@ class NovelRepository(
 
         // Seed some initial chapters and folders if empty
         val currentNodes = manuscriptDao.getAllNodesFlow().firstOrNull() ?: emptyList()
+        var novelFolderId = currentNodes.firstOrNull { it.parentId == null && it.isFolder }?.id ?: 0
+
         if (currentNodes.isEmpty()) {
-            // Create a main Novel Folder
-            val novelFolderId = manuscriptDao.insertNode(
+            // Create a main Novel Folder (Root Novel)
+            novelFolderId = manuscriptDao.insertNode(
                 ManuscriptNode(
                     name = "The Lost Cartographer",
+                    parentId = null,
                     isFolder = true
                 )
             ).toInt()
 
             // Inside Novel, create chapters
-            val prologueId = manuscriptDao.insertNode(
+            manuscriptDao.insertNode(
                 ManuscriptNode(
                     name = "Prologue: Coordinates of the Abyss",
                     parentId = novelFolderId,
@@ -93,7 +165,7 @@ But Soren couldn't stop. The sea was writing a story on the shores of Vael-Anor,
                 )
             )
 
-            val chapter1Id = manuscriptDao.insertNode(
+            manuscriptDao.insertNode(
                 ManuscriptNode(
                     name = "Chapter 1: Ink and Iron",
                     parentId = novelFolderId,
@@ -117,10 +189,11 @@ He had to protect the charts. The coordinates of the shifting sea were more than
                 )
             )
 
-            // Outside Novel, create a folder for Outline and Lore
+            // Inside Novel, create a folder for Outline and Lore
             val loreFolderId = manuscriptDao.insertNode(
                 ManuscriptNode(
                     name = "Lore & World Building",
+                    parentId = novelFolderId,
                     isFolder = true
                 )
             ).toInt()
@@ -141,9 +214,9 @@ Unlike standard terrestrial worlds, the world of Vael-Anor is enveloped by a dyn
             )
         }
 
-        // Seed some initial characters if empty
+        // Seed some initial characters if empty (associated explicitly with the novel)
         val currentCharacters = characterDao.getAllCharactersFlow().firstOrNull() ?: emptyList()
-        if (currentCharacters.isEmpty()) {
+        if (currentCharacters.isEmpty() && novelFolderId != 0) {
             characterDao.insertCharacter(
                 CharacterProfile(
                     name = "Soren Vance",
@@ -152,7 +225,9 @@ Unlike standard terrestrial worlds, the world of Vael-Anor is enveloped by a dyn
                     appearance = "Tall and lean, with ink-stained fingers and gray eyes. Wears a worn cartographer's oilskin coat and keeps his drafting glass tucked into a leather chest strap.",
                     backstory = "Orphaned during the Great Shift of 2012 (imperial reckoning). Apprenticed to Master Charles, the harbor cartographer. Soren secretly possesses the forbidden Gift of Shifting Vision, allowing him to perceive the subterranean patterns of the fluid sea.",
                     plotArc = "Soren begins as a passive apprentice trying to survive under the Archon's strict laws. As he uncovers the corruption of the Astrolabe Prime, he must decide whether to publish his secret charts and plunge Vael-Anor into revolution, or keep quiet to save his mentor.",
-                    notes = "Strengths: Brilliant mathematician, high spatial memory, exceptionally loyal.\nWeaknesses: Impulsive when curious, lacks physical combat training, prone to chronic insomnia."
+                    notes = "Strengths: Brilliant mathematician, high spatial memory, exceptionally loyal.\nWeaknesses: Impulsive when curious, lacks physical combat training, prone to chronic insomnia.",
+                    avatarColor = 0xFF6366F1.toInt(),
+                    novelId = novelFolderId
                 )
             )
 
@@ -164,7 +239,9 @@ Unlike standard terrestrial worlds, the world of Vael-Anor is enveloped by a dyn
                     appearance = "Broad-shouldered, clad in the silver-and-blue plate armor of the Archon's Registry Guard. His left cheek bears a jagged white scar from sea-serpent obsidian shrapnel.",
                     backstory = "A decorated military officer who rose through the ranks by ruthlessly enforcing the Archon's navigation monopoly. Cross believes that the Shifting Sea is a chaotic demonic force, and only the Archon's absolute order prevents humanity's total extinction.",
                     plotArc = "Cross is hunting Soren down to seize the shifting coordinates map. He represents structural stability at the cost of personal liberty, and will stop at nothing to capture the 'heretic mapmaker'.",
-                    notes = "Weapon of Choice: Clockwork sabre which hums with light-energy.\nQuotes: 'Order is the only bridge over the abyss, cartographer. Break the compass, and you break Vael-Anor.'"
+                    notes = "Weapon of Choice: Clockwork sabre which hums with light-energy.\nQuotes: 'Order is the only bridge over the abyss, cartographer. Break the compass, and you break Vael-Anor.'",
+                    avatarColor = 0xFFEF4444.toInt(),
+                    novelId = novelFolderId
                 )
             )
 
@@ -176,20 +253,23 @@ Unlike standard terrestrial worlds, the world of Vael-Anor is enveloped by a dyn
                     appearance = "Athletic build, weathered bronze skin, with dark braided hair woven with copper wire. Often covered in grease and soot from her steam-skiff engines.",
                     backstory = "Soren's adoptive sister, an expert mechanical engineer who builds and repairs illegal speed boats (steam-skiffs) for the harbor smugglers.",
                     plotArc = "Lyra acts as Soren's escape plan and tactical support. She helps Soren navigate the shifting reefs in her customized skiff, 'The Copper Needle'.",
-                    notes = "Talents: Fast repairs under fire, lockpicking, excellent pilot.\nGoals: Wants to escape the Archon's territory to find the legendary Free Floating Islands."
+                    notes = "Talents: Fast repairs under fire, lockpicking, excellent pilot.\nGoals: Wants to escape the Archon's territory to find the legendary Free Floating Islands.",
+                    avatarColor = 0xFF10B981.toInt(),
+                    novelId = novelFolderId
                 )
             )
         }
 
         // Seed some initial plot events and relationships if empty
         val currentEvents = storyEventDao.getAllEventsFlow().firstOrNull() ?: emptyList()
-        if (currentEvents.isEmpty()) {
+        if (currentEvents.isEmpty() && novelFolderId != 0) {
             val event1Id = storyEventDao.insertEvent(
                 StoryEvent(
                     title = "Discovery of Shifting Silt",
                     description = "Soren analyzes maps of the Southern Reach and realizes the ocean bed itself is migrating in a mathematically predictable spiral.",
                     arcPhase = "Setup",
-                    orderIndex = 1
+                    orderIndex = 1,
+                    novelId = novelFolderId
                 )
             ).toInt()
 
@@ -198,7 +278,8 @@ Unlike standard terrestrial worlds, the world of Vael-Anor is enveloped by a dyn
                     title = "The Harbor Workshop Raid",
                     description = "Commander Draven Cross leads a squadron of the Archon's High Registry Guard to raid Soren's workshop. Soren barely escapes with his life and the forbidden maps.",
                     arcPhase = "Inciting Incident",
-                    orderIndex = 2
+                    orderIndex = 2,
+                    novelId = novelFolderId
                 )
             ).toInt()
 
@@ -207,7 +288,8 @@ Unlike standard terrestrial worlds, the world of Vael-Anor is enveloped by a dyn
                     title = "Escape via The Copper Needle",
                     description = "Lyra pilots her souped-up steam skiff through unstable reefs to outrun Cross's ironclad ships, validating Soren's calculations of reef shifts.",
                     arcPhase = "Rising Action",
-                    orderIndex = 3
+                    orderIndex = 3,
+                    novelId = novelFolderId
                 )
             ).toInt()
 
@@ -216,80 +298,84 @@ Unlike standard terrestrial worlds, the world of Vael-Anor is enveloped by a dyn
                     title = "Infiltrating Astrolabe Prime",
                     description = "Soren and Lyra sneak into the heart of the clockwork lighthouse to expose how the Archon manipulates stable coordinates.",
                     arcPhase = "Climax",
-                    orderIndex = 4
+                    orderIndex = 4,
+                    novelId = novelFolderId
                 )
             ).toInt()
 
-            // Seed Relationships (ER Connections)
-            val characters = characterDao.getAllCharactersFlow().firstOrNull() ?: emptyList()
+            // Seed Relationships (Associated explicitly with the novel)
+            val characters = characterDao.getCharactersByNovel(novelFolderId)
             val sorenId = characters.find { it.name.contains("Soren") }?.id ?: 0
             val crossId = characters.find { it.name.contains("Cross") }?.id ?: 0
             val lyraId = characters.find { it.name.contains("Lyra") }?.id ?: 0
 
             if (sorenId != 0 && crossId != 0) {
-                // Soren vs Cross relationship
                 characterRelationshipDao.insertRelationship(
                     CharacterRelationship(
                         sourceCharacterId = sorenId,
                         targetId = crossId,
                         isToEvent = false,
                         relationType = "Rival / Hunter",
-                        description = "Cross hunts Soren to seize his shifting-coordinates map; Soren opposes Cross's tyranny."
+                        description = "Cross hunts Soren to seize his shifting-coordinates map; Soren opposes Cross's tyranny.",
+                        novelId = novelFolderId
                     )
                 )
             }
 
             if (sorenId != 0 && lyraId != 0) {
-                // Soren & Lyra sibling relationship
                 characterRelationshipDao.insertRelationship(
                     CharacterRelationship(
                         sourceCharacterId = sorenId,
                         targetId = lyraId,
                         isToEvent = false,
                         relationType = "Adoptive Sibling / Ally",
-                        description = "Grew up together in Charles's workshop. Lyra provides the engines, Soren provides the navigation."
+                        description = "Grew up together in Charles's workshop. Lyra provides the engines, Soren provides the navigation.",
+                        novelId = novelFolderId
                     )
                 )
             }
 
             if (sorenId != 0 && event1Id != 0) {
-                // Soren present at event 1
                 characterRelationshipDao.insertRelationship(
                     CharacterRelationship(
                         sourceCharacterId = sorenId,
                         targetId = event1Id,
                         isToEvent = true,
                         relationType = "Main Investigator",
-                        description = "Soren discovers the anomalous shifts during late-night map drafting."
+                        description = "Soren discovers the anomalous shifts during late-night map drafting.",
+                        novelId = novelFolderId
                     )
                 )
             }
 
             if (crossId != 0 && event2Id != 0) {
-                // Cross triggers event 2
                 characterRelationshipDao.insertRelationship(
                     CharacterRelationship(
                         sourceCharacterId = crossId,
                         targetId = event2Id,
                         isToEvent = true,
                         relationType = "Raiding Commander",
-                        description = "Cross leads the attack on Master Charles's harbor watchtower."
+                        description = "Cross leads the attack on Master Charles's harbor watchtower.",
+                        novelId = novelFolderId
                     )
                 )
             }
 
             if (lyraId != 0 && event3Id != 0) {
-                // Lyra drives event 3
                 characterRelationshipDao.insertRelationship(
                     CharacterRelationship(
                         sourceCharacterId = lyraId,
                         targetId = event3Id,
                         isToEvent = true,
                         relationType = "Pilot",
-                        description = "Lyra steers the skiff through high-tide shoals under heavy cannon fire."
+                        description = "Lyra steers the skiff through high-tide shoals under heavy cannon fire.",
+                        novelId = novelFolderId
                     )
                 )
             }
         }
+
+        // Always run association repair to fix any pre-existing records with null novelId
+        repairMissingNovelAssociations()
     }
 }

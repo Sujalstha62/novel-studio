@@ -11,7 +11,8 @@ data class ManuscriptNode(
     val isFolder: Boolean,
     val content: String = "",
     val lastUpdated: Long = System.currentTimeMillis(),
-    val wordCount: Int = 0
+    val wordCount: Int = 0,
+    val lastAnalyzedHash: String? = null
 )
 
 @Entity(tableName = "character_profiles")
@@ -35,7 +36,8 @@ data class WritingSettings(
     val fontSize: Int = 18,
     val isDistractionFree: Boolean = false,
     val isAutoSyncEnabled: Boolean = true,
-    val lastSyncedTime: Long = System.currentTimeMillis()
+    val lastSyncedTime: Long = System.currentTimeMillis(),
+    val isAutoAnalysisEnabled: Boolean = false
 )
 
 @Entity(tableName = "story_events")

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.util.Log
+import android.widget.Toast
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -17,19 +18,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileWriter
-
-enum class SyncStatus {
-    IDLE,
-    SYNCING,
-    SUCCESS,
-    ERROR
-}
 
 sealed class ActiveTab {
     object Manuscript : ActiveTab()
@@ -48,6 +40,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- State flows ---
     val allNodes: StateFlow<List<ManuscriptNode>>
+    val rootNovels: StateFlow<List<ManuscriptNode>>
     val allCharacters: StateFlow<List<CharacterProfile>>
     val settings: StateFlow<WritingSettings>
     val allEvents: StateFlow<List<StoryEvent>>
@@ -86,23 +79,39 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
     private val _grammarSuggestions = MutableStateFlow<List<GrammarSuggestion>>(emptyList())
     val grammarSuggestions: StateFlow<List<GrammarSuggestion>> = _grammarSuggestions.asStateFlow()
 
-    // --- Cloud Sync state ---
-    private val _syncStatus = MutableStateFlow(SyncStatus.IDLE)
-    val syncStatus: StateFlow<SyncStatus> = _syncStatus.asStateFlow()
+    // --- Honest Local Storage & Save State (No fake cloud sync) ---
+    private val _lastSavedTimeText = MutableStateFlow("Saved locally")
+    val lastSavedTimeText: StateFlow<String> = _lastSavedTimeText.asStateFlow()
 
-    private val _lastSyncedTimeText = MutableStateFlow("Synced locally")
-    val lastSyncedTimeText: StateFlow<String> = _lastSyncedTimeText.asStateFlow()
+    private val _isSavingLocally = MutableStateFlow(false)
+    val isSavingLocally: StateFlow<Boolean> = _isSavingLocally.asStateFlow()
 
     // --- Active Character profile details ---
     private val _editingCharacter = MutableStateFlow<CharacterProfile?>(null)
     val editingCharacter: StateFlow<CharacterProfile?> = _editingCharacter.asStateFlow()
 
+    // --- Reviewable Proposed Changes for AI Story Analysis ---
+    private val _isAnalyzingStory = MutableStateFlow(false)
+    val isAnalyzingStory: StateFlow<Boolean> = _isAnalyzingStory.asStateFlow()
+
+    private val _proposedChanges = MutableStateFlow<List<ProposedChange>>(emptyList())
+    val proposedChanges: StateFlow<List<ProposedChange>> = _proposedChanges.asStateFlow()
+
+    private val _showReviewDialog = MutableStateFlow(false)
+    val showReviewDialog: StateFlow<Boolean> = _showReviewDialog.asStateFlow()
+
+    private val _analysisStatusMessage = MutableStateFlow<String?>(null)
+    val analysisStatusMessage: StateFlow<String?> = _analysisStatusMessage.asStateFlow()
+
+    private var currentlyAnalyzingNodeId: Int? = null
+    private var currentlyAnalyzingHash: String? = null
+
     private var autoSaveJob: Job? = null
-    private var aiTrackerJob: Job? = null
 
     init {
         val database = AppDatabase.getDatabase(application)
         repository = NovelRepository(
+            database,
             database.manuscriptDao(),
             database.characterDao(),
             database.settingsDao(),
@@ -112,6 +121,15 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         )
 
         allNodes = repository.allNodes.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+        // Only root-level folders (parentId == null && isFolder == true) represent novels
+        rootNovels = allNodes.map { nodes ->
+            nodes.filter { it.parentId == null && it.isFolder }
+        }.stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
@@ -150,7 +168,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         )
 
         filteredCharacters = combine(allCharacters, _selectedNovelId) { chars, novelId ->
-            if (novelId == null) chars
+            if (novelId == null) emptyList()
             else chars.filter { it.novelId == novelId }
         }.stateIn(
             scope = viewModelScope,
@@ -159,7 +177,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         )
 
         filteredEvents = combine(allEvents, _selectedNovelId) { events, novelId ->
-            if (novelId == null) events
+            if (novelId == null) emptyList()
             else events.filter { it.novelId == novelId }
         }.stateIn(
             scope = viewModelScope,
@@ -168,7 +186,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         )
 
         filteredRelationships = combine(allRelationships, _selectedNovelId) { relationships, novelId ->
-            if (novelId == null) relationships
+            if (novelId == null) emptyList()
             else relationships.filter { it.novelId == novelId }
         }.stateIn(
             scope = viewModelScope,
@@ -176,31 +194,30 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
             initialValue = emptyList()
         )
 
-        // Seed data and start initial setup
+        // Seed data and guarantee novel associations
         viewModelScope.launch {
             repository.seedInitialDataIfEmpty()
-            updateSyncTimeText()
-            startPeriodicAutoSync()
         }
 
-        // Auto select first novel if selectedNovelId is null
+        // Auto select first novel if selectedNovelId is null or missing
         viewModelScope.launch {
-            allNodes.collect { nodes ->
-                if (_selectedNovelId.value == null) {
-                    val firstNovel = nodes.firstOrNull { it.isFolder && it.parentId == null }
-                    if (firstNovel != null) {
-                        _selectedNovelId.value = firstNovel.id
+            rootNovels.collect { novels ->
+                if (novels.isNotEmpty()) {
+                    if (_selectedNovelId.value == null || novels.none { it.id == _selectedNovelId.value }) {
+                        _selectedNovelId.value = novels.first().id
                     }
+                } else {
+                    _selectedNovelId.value = null
                 }
             }
         }
 
-        // Auto-update selectedNovelId if activeNode belongs to a specific novel folder
+        // Auto-update selectedNovelId if activeNode belongs to a specific root novel folder
         viewModelScope.launch {
             activeNode.collect { node ->
                 if (node != null) {
                     val novelId = findNovelFolderIdForNode(node.id)
-                    if (novelId != null) {
+                    if (novelId != null && novelId != _selectedNovelId.value) {
                         _selectedNovelId.value = novelId
                     }
                 }
@@ -213,19 +230,56 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         _activeTab.value = tab
     }
 
+    // --- Novel Selector & Novel Creation ---
+    fun selectNovel(novelId: Int?) {
+        _selectedNovelId.value = novelId
+        // If current active node doesn't belong to new novel, deselect editor node
+        val active = _activeNode.value
+        if (active != null && novelId != null) {
+            val nodeNovelId = findNovelFolderIdForNode(active.id)
+            if (nodeNovelId != null && nodeNovelId != novelId) {
+                selectNode(null)
+            }
+        }
+    }
+
+    fun createNovel(name: String) {
+        viewModelScope.launch {
+            val newNovelId = repository.insertNode(
+                ManuscriptNode(
+                    name = name.ifBlank { "Untitled Novel" },
+                    parentId = null,
+                    isFolder = true
+                )
+            ).toInt()
+            _selectedNovelId.value = newNovelId
+            _lastSavedTimeText.value = "New novel created locally"
+        }
+    }
+
+    fun findNovelFolderIdForNode(nodeId: Int): Int? {
+        val nodes = allNodes.value
+        var current = nodes.find { it.id == nodeId }
+        while (current != null) {
+            if (current.parentId == null) {
+                return if (current.isFolder) current.id else null
+            }
+            current = nodes.find { it.id == current.parentId }
+        }
+        return null
+    }
+
     // --- Node operations ---
     fun selectNode(nodeId: Int?) {
         _selectedNodeId.value = nodeId
-        _grammarSuggestions.value = emptyList() // clear previous suggestions
+        _grammarSuggestions.value = emptyList()
         if (nodeId == null) {
             _activeNode.value = null
             _editorText.value = ""
             _wordCount.value = 0
             autoSaveJob?.cancel()
-            aiTrackerJob?.cancel()
         } else {
             autoSaveJob?.cancel()
-            aiTrackerJob?.cancel()
             viewModelScope.launch {
                 val node = repository.getNodeById(nodeId)
                 if (node != null && !node.isFolder) {
@@ -248,14 +302,19 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         return text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }.size
     }
 
+    /**
+     * Local Auto-Save: Debounces user typing and writes to local database.
+     * Note: This does NOT trigger Gemini story analysis automatically.
+     */
     private fun setupAutoSave(node: ManuscriptNode) {
         autoSaveJob?.cancel()
         autoSaveJob = viewModelScope.launch {
             _editorText
-                .debounce(1000) // save after 1 second of inactivity
+                .debounce(1000)
                 .collect { content ->
                     val currentActive = _activeNode.value
                     if (currentActive != null && currentActive.id == node.id && currentActive.content != content) {
+                        _isSavingLocally.value = true
                         val updatedNode = currentActive.copy(
                             content = content,
                             wordCount = countWords(content),
@@ -263,15 +322,17 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         repository.updateNode(updatedNode)
                         _activeNode.value = updatedNode
-                        triggerAutoSync()
+                        _isSavingLocally.value = false
+                        _lastSavedTimeText.value = "Saved locally just now"
 
-                        // Automatically trigger AI story analysis in the background
-                        // after 5 seconds of continued inactivity following the save.
-                        aiTrackerJob?.cancel()
-                        aiTrackerJob = viewModelScope.launch {
-                            delay(5000)
-                            if (content.trim().length > 15) {
-                                runAIStoryAnalysis(node.id)
+                        // If user explicitly turned ON automatic analysis in settings, run throttled
+                        if (settings.value.isAutoAnalysisEnabled) {
+                            val currentHash = content.hashCode().toString()
+                            if (content.trim().length > 30 && currentHash != node.lastAnalyzedHash) {
+                                delay(30000) // Heavy 30s throttle
+                                if (!_isAnalyzingStory.value && _activeNode.value?.id == node.id) {
+                                    runAIStoryAnalysis(node.id, isManual = false)
+                                }
                             }
                         }
                     }
@@ -281,46 +342,53 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
 
     fun createFolder(name: String, parentId: Int?) {
         viewModelScope.launch {
+            // Default to selectedNovelId if parentId is null so folders belong to the active novel
+            val targetParent = parentId ?: _selectedNovelId.value
             repository.insertNode(
                 ManuscriptNode(
                     name = name,
-                    parentId = parentId,
+                    parentId = targetParent,
                     isFolder = true
                 )
             )
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Folder created locally"
         }
     }
 
     fun createFile(name: String, parentId: Int?) {
         viewModelScope.launch {
+            val targetParent = parentId ?: _selectedNovelId.value
             val newId = repository.insertNode(
                 ManuscriptNode(
                     name = name,
-                    parentId = parentId,
+                    parentId = targetParent,
                     isFolder = false,
                     content = ""
                 )
             ).toInt()
             selectNode(newId)
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Draft created locally"
         }
     }
 
+    /**
+     * Deletes a node recursively. If a folder, all its children and deeper descendants
+     * are deleted in a single Room transaction to eliminate orphan records.
+     * If deleting an entire novel, all novel-specific records are safely cleaned up.
+     */
     fun deleteNode(node: ManuscriptNode) {
         viewModelScope.launch {
             if (selectedNodeId.value == node.id) {
                 selectNode(null)
             }
-            repository.deleteNode(node)
-            // also recursively delete children if folder (simplified, could do a deeper clean but this is clean)
-            if (node.isFolder) {
-                val children = allNodes.value.filter { it.parentId == node.id }
-                children.forEach { child ->
-                    repository.deleteNode(child)
-                }
+            repository.deleteNodeRecursively(node)
+
+            // If deleted novel was active, pick another root novel
+            if (node.parentId == null && node.isFolder && _selectedNovelId.value == node.id) {
+                val remainingNovels = rootNovels.value.filter { it.id != node.id }
+                _selectedNovelId.value = remainingNovels.firstOrNull()?.id
             }
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Deleted locally"
         }
     }
 
@@ -329,7 +397,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
             val node = repository.getNodeById(nodeId)
             if (node != null) {
                 repository.updateNode(node.copy(name = newName, lastUpdated = System.currentTimeMillis()))
-                triggerAutoSync()
+                _lastSavedTimeText.value = "Renamed locally"
             }
         }
     }
@@ -359,17 +427,12 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         val original = suggestion.originalText
         val replacement = suggestion.suggestedText
 
-        // Avoid empty target matching
         if (original.isBlank()) return
 
-        // Simple string replacement for direct edits
         val updatedText = currentText.replaceFirst(original, replacement)
         updateEditorText(updatedText)
-
-        // Remove applied suggestion from the active list
         _grammarSuggestions.value = _grammarSuggestions.value.filter { it != suggestion }
 
-        // Trigger an immediate save of text
         viewModelScope.launch {
             val currentActive = _activeNode.value
             if (currentActive != null) {
@@ -380,6 +443,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 repository.updateNode(updatedNode)
                 _activeNode.value = updatedNode
+                _lastSavedTimeText.value = "Suggestion applied & saved"
             }
         }
     }
@@ -402,6 +466,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         novelId: Int? = _selectedNovelId.value
     ) {
         viewModelScope.launch {
+            val assignedNovelId = novelId ?: _selectedNovelId.value ?: 1
             val char = CharacterProfile(
                 id = if (id == 0) 0 else id,
                 name = name,
@@ -412,11 +477,11 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                 plotArc = plotArc,
                 notes = notes,
                 avatarColor = avatarColor,
-                novelId = novelId
+                novelId = assignedNovelId
             )
             repository.insertCharacter(char)
             _editingCharacter.value = null
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Character profile saved"
         }
     }
 
@@ -426,7 +491,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
             if (_editingCharacter.value?.id == character.id) {
                 _editingCharacter.value = null
             }
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Character deleted"
         }
     }
 
@@ -461,64 +526,22 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setAutoSyncEnabled(enabled: Boolean) {
+    fun setAutoAnalysisEnabled(enabled: Boolean) {
         viewModelScope.launch {
             val currentSettings = settings.value
-            repository.insertOrUpdateSettings(currentSettings.copy(isAutoSyncEnabled = enabled))
+            repository.insertOrUpdateSettings(currentSettings.copy(isAutoAnalysisEnabled = enabled))
         }
     }
 
-    // --- Automatic / Simulated Cloud Sync ---
-    private fun triggerAutoSync() {
-        if (settings.value.isAutoSyncEnabled) {
-            viewModelScope.launch {
-                triggerSync()
-            }
-        }
-    }
-
-    suspend fun triggerSync() {
-        if (_syncStatus.value == SyncStatus.SYNCING) return
-        _syncStatus.value = SyncStatus.SYNCING
-        delay(1500) // simulate network delay for saving to the cloud database
-        _syncStatus.value = SyncStatus.SUCCESS
-        val now = System.currentTimeMillis()
-        val currentSettings = settings.value
-        repository.insertOrUpdateSettings(currentSettings.copy(lastSyncedTime = now))
-        updateSyncTimeText()
-        delay(1500)
-        _syncStatus.value = SyncStatus.IDLE
-    }
-
-    private fun startPeriodicAutoSync() {
-        viewModelScope.launch {
-            while (true) {
-                delay(60000) // check and sync every minute if enabled and state is dirty
-                updateSyncTimeText()
-            }
-        }
-    }
-
-    private fun updateSyncTimeText() {
-        val lastSynced = settings.value.lastSyncedTime
-        val diff = System.currentTimeMillis() - lastSynced
-        _lastSyncedTimeText.value = when {
-            diff < 10000 -> "Synced just now"
-            diff < 60000 -> "Synced less than a minute ago"
-            else -> {
-                val mins = diff / 60000
-                "Synced ${mins}m ago"
-            }
-        }
-    }
-
-    // --- Integrated Export Manager ---
-    fun exportManuscript(context: Context, format: String, nodeId: Int?): Uri? {
+    // --- Safe File Export & Android Sharing System ---
+    fun exportManuscript(context: Context, format: String, nodeId: Int?, novelId: Int? = _selectedNovelId.value): Uri? {
         val nodesList = allNodes.value
         val builder = java.lang.StringBuilder()
+        val targetNovel = rootNovels.value.find { it.id == novelId }
+        val novelTitle = targetNovel?.name ?: "Novel Manuscript"
 
         if (nodeId != null) {
-            // Export single file
+            // Export single file / chapter
             val node = nodesList.find { it.id == nodeId } ?: return null
             when (format) {
                 "Standard Manuscript (TXT)" -> {
@@ -535,7 +558,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     builder.append("<meta charset=\"utf-8\">\n")
                     builder.append("<title>${node.name}</title>\n")
                     builder.append("<style>\n")
-                    builder.append("body { font-family: 'Garamond', 'Georgia', serif; line-height: 1.8; margin: 3in 2in; font-size: 12pt; }\n")
+                    builder.append("body { font-family: 'Garamond', 'Georgia', serif; line-height: 1.8; margin: 2in 1.5in; font-size: 12pt; color: #111; }\n")
                     builder.append("h1 { text-align: center; text-transform: uppercase; margin-bottom: 2em; }\n")
                     builder.append("p { text-indent: 0.5in; margin-bottom: 0; margin-top: 0; text-align: justify; }\n")
                     builder.append("</style>\n</head>\n<body>\n")
@@ -549,51 +572,93 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         } else {
-            // Export entire Book
-            builder.append("THE SHATTERED MANUSCRIPT\n\n")
-            val rootNodes = nodesList.filter { it.parentId == null }
-            rootNodes.forEach { rootNode ->
-                appendNodeToExport(rootNode, nodesList, format, builder, 0)
+            // Export entire Book belonging to target novel
+            when (format) {
+                "Creative Markdown (MD)" -> {
+                    builder.append("# ${novelTitle.uppercase()}\n\n")
+                }
+                "Professional HTML" -> {
+                    builder.append("<!DOCTYPE html>\n<html>\n<head>\n")
+                    builder.append("<meta charset=\"utf-8\">\n")
+                    builder.append("<title>$novelTitle</title>\n")
+                    builder.append("<style>\n")
+                    builder.append("body { font-family: 'Garamond', 'Georgia', serif; line-height: 1.8; margin: 2in 1.5in; font-size: 12pt; color: #111; }\n")
+                    builder.append("h1.title { text-align: center; text-transform: uppercase; margin-top: 3in; margin-bottom: 3in; font-size: 28pt; }\n")
+                    builder.append("h2 { text-align: center; margin-top: 2em; margin-bottom: 1em; page-break-before: always; }\n")
+                    builder.append("p { text-indent: 0.5in; margin-bottom: 0; margin-top: 0; text-align: justify; }\n")
+                    builder.append("</style>\n</head>\n<body>\n")
+                    builder.append("<h1 class=\"title\">$novelTitle</h1>\n")
+                }
+                else -> {
+                    builder.append("==================================================\n")
+                    builder.append("               ${novelTitle.uppercase()}\n")
+                    builder.append("==================================================\n\n\n")
+                }
+            }
+
+            // Export nodes belonging to this novel
+            val topNodesForNovel = if (targetNovel != null) {
+                nodesList.filter { it.parentId == targetNovel.id }
+            } else {
+                nodesList.filter { it.parentId == null }
+            }
+
+            topNodesForNovel.forEach { node ->
+                appendNodeToExport(node, nodesList, format, builder, 0)
+            }
+
+            if (format == "Professional HTML") {
+                builder.append("</body>\n</html>")
             }
         }
 
-        // Write to temporary sharing file
         val extension = when (format) {
             "Standard Manuscript (TXT)" -> "txt"
             "Creative Markdown (MD)" -> "md"
             "Professional HTML" -> "html"
             else -> "txt"
         }
-        val fileName = "Novel_Export_${System.currentTimeMillis()}.$extension"
-        val file = File(context.cacheDir, fileName)
-        try {
-            val writer = FileWriter(file)
-            writer.write(builder.toString())
-            writer.flush()
-            writer.close()
 
-            // Get Share Uri via FileProvider
+        val sanitizedTitle = novelTitle.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+        val fileName = "${sanitizedTitle}_${System.currentTimeMillis()}.$extension"
+
+        return try {
+            // Dedicated export directory in cacheDir configured in provider paths
+            val exportDir = File(context.cacheDir, "exports").apply { mkdirs() }
+            val file = File(exportDir, fileName)
+
+            FileWriter(file).use { writer ->
+                writer.write(builder.toString())
+                writer.flush()
+            }
+
             val authority = "${context.packageName}.fileprovider"
             val uri = FileProvider.getUriForFile(context, authority, file)
 
-            // Trigger Share Intent
+            val mimeType = when (extension) {
+                "txt" -> "text/plain"
+                "md" -> "text/markdown"
+                "html" -> "text/html"
+                else -> "text/plain"
+            }
+
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                type = when (extension) {
-                    "txt" -> "text/plain"
-                    "md" -> "text/markdown"
-                    "html" -> "text/html"
-                    else -> "text/plain"
-                }
+                type = mimeType
                 putExtra(Intent.EXTRA_STREAM, uri)
-                putExtra(Intent.EXTRA_SUBJECT, "Manuscript Export")
+                putExtra(Intent.EXTRA_SUBJECT, "$novelTitle - Manuscript Export")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            context.startActivity(Intent.createChooser(shareIntent, "Export Manuscript via"))
-            return uri
+
+            val chooser = Intent.createChooser(shareIntent, "Share Manuscript via").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(chooser)
+            uri
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to write export file: ${e.message}", e)
+            Log.e(TAG, "Export and share failed: ${e.message}", e)
+            Toast.makeText(context, "Export failed: ${e.localizedMessage ?: "Unknown error"}", Toast.LENGTH_LONG).show()
+            null
         }
-        return null
     }
 
     private fun appendNodeToExport(
@@ -629,7 +694,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     builder.append("\n\n")
                 }
                 "Professional HTML" -> {
-                    builder.append("<h${depth + 2}>${node.name}</h${depth + 2}>\n")
+                    builder.append("<h2>${node.name}</h2>\n")
                     node.content.split("\n\n").forEach { paragraph ->
                         if (paragraph.isNotBlank()) {
                             builder.append("<p>${paragraph.trim()}</p>\n")
@@ -641,7 +706,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- Version Backups (GitHub style) & Commits ---
+    // --- Version Backups & Commits ---
     fun commitDraft(nodeId: Int, commitMessage: String) {
         val node = allNodes.value.find { it.id == nodeId } ?: return
         viewModelScope.launch {
@@ -654,7 +719,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                 timestamp = System.currentTimeMillis()
             )
             repository.insertCommit(commit)
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Draft snapshot committed locally"
         }
     }
 
@@ -673,7 +738,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     _editorText.value = commit.contentSnapshot
                     _wordCount.value = countWords(commit.contentSnapshot)
                 }
-                triggerAutoSync()
+                _lastSavedTimeText.value = "Restored draft snapshot"
             }
         }
     }
@@ -681,7 +746,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteCommit(commitId: Int) {
         viewModelScope.launch {
             repository.deleteCommitById(commitId)
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Snapshot deleted"
         }
     }
 
@@ -692,13 +757,14 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveStoryEvent(id: Int, title: String, description: String, arcPhase: String, orderIndex: Int, novelId: Int? = _selectedNovelId.value) {
         viewModelScope.launch {
+            val assignedNovelId = novelId ?: _selectedNovelId.value ?: 1
             val event = StoryEvent(
                 id = id,
                 title = title,
                 description = description,
                 arcPhase = arcPhase,
                 orderIndex = orderIndex,
-                novelId = novelId
+                novelId = assignedNovelId
             )
             if (id == 0) {
                 repository.insertEvent(event)
@@ -706,7 +772,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                 repository.updateEvent(event)
             }
             _editingEvent.value = null
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Storyline event saved"
         }
     }
 
@@ -716,74 +782,79 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
             if (_editingEvent.value?.id == event.id) {
                 _editingEvent.value = null
             }
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Storyline event deleted"
         }
     }
 
     // --- ER Relationship Diagram connections ---
     fun addRelationship(sourceCharId: Int, targetId: Int, isToEvent: Boolean, relationType: String, description: String, novelId: Int? = _selectedNovelId.value) {
         viewModelScope.launch {
+            val assignedNovelId = novelId ?: _selectedNovelId.value ?: 1
             val rel = CharacterRelationship(
                 sourceCharacterId = sourceCharId,
                 targetId = targetId,
                 isToEvent = isToEvent,
                 relationType = relationType,
                 description = description,
-                novelId = novelId
+                novelId = assignedNovelId
             )
             repository.insertRelationship(rel)
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Relationship saved"
         }
     }
 
     fun deleteRelationship(relationship: CharacterRelationship) {
         viewModelScope.launch {
             repository.deleteRelationship(relationship)
-            triggerAutoSync()
+            _lastSavedTimeText.value = "Relationship deleted"
         }
     }
 
-    // --- Novel Selector & Tree Helper ---
-    fun selectNovel(novelId: Int?) {
-        _selectedNovelId.value = novelId
+    // --- Intentional AI Story Analysis with Reviewable Proposed Changes ---
+    fun requestAIStoryAnalysis(nodeId: Int, forceReanalyze: Boolean = false) {
+        runAIStoryAnalysis(nodeId, isManual = true, forceReanalyze = forceReanalyze)
     }
 
-    fun findNovelFolderIdForNode(nodeId: Int): Int? {
-        val nodes = allNodes.value
-        var current = nodes.find { it.id == nodeId }
-        while (current != null) {
-            if (current.parentId == null) {
-                return if (current.isFolder) current.id else null
-            }
-            current = nodes.find { it.id == current.parentId }
-        }
-        return null
-    }
-
-    // --- AI Story Auto-Tracker Agent ---
-    private val _isAnalyzingStory = MutableStateFlow(false)
-    val isAnalyzingStory: StateFlow<Boolean> = _isAnalyzingStory.asStateFlow()
-
-    fun runAIStoryAnalysis(nodeId: Int) {
+    private fun runAIStoryAnalysis(nodeId: Int, isManual: Boolean, forceReanalyze: Boolean = false) {
         val node = allNodes.value.find { it.id == nodeId } ?: return
-        if (node.content.isBlank()) return
+        if (node.content.isBlank()) {
+            if (isManual) {
+                _analysisStatusMessage.value = "Cannot analyze empty chapter text."
+            }
+            return
+        }
+
+        // Prevent duplicate simultaneous analysis
+        if (_isAnalyzingStory.value) return
+
+        val contentHash = node.content.hashCode().toString()
+        if (!forceReanalyze && node.lastAnalyzedHash == contentHash) {
+            if (isManual) {
+                _analysisStatusMessage.value = "No new manuscript changes to analyze in this chapter."
+            }
+            return
+        }
 
         _isAnalyzingStory.value = true
+        _analysisStatusMessage.value = "Analyzing narrative with AI..."
+        currentlyAnalyzingNodeId = nodeId
+        currentlyAnalyzingHash = contentHash
 
         viewModelScope.launch {
             try {
-                // Find corresponding novel folder for this node
-                val novelId = findNovelFolderIdForNode(nodeId) ?: _selectedNovelId.value
+                val novelId = findNovelFolderIdForNode(nodeId) ?: _selectedNovelId.value ?: 1
                 val extracted = storyTracker.trackStory(node.content, node.name)
 
-                // 1. Insert/Update Character Profiles
-                val characterIds = mutableMapOf<String, Int>()
-                extracted.characters.forEach { extChar ->
-                    // Check if character already exists in this novel (case-insensitive)
-                    val existing = allCharacters.value.find {
-                        it.name.equals(extChar.name, ignoreCase = true) && it.novelId == novelId
-                    }
+                // Build proposed changes by comparing against existing database data for this novel
+                val changes = mutableListOf<ProposedChange>()
 
+                val currentNovelChars = allCharacters.value.filter { it.novelId == novelId }
+                val currentNovelEvents = allEvents.value.filter { it.novelId == novelId }
+                val currentNovelRels = allRelationships.value.filter { it.novelId == novelId }
+
+                // 1. Proposed Characters
+                extracted.characters.forEach { extChar ->
+                    val existing = currentNovelChars.find { it.name.equals(extChar.name, ignoreCase = true) }
                     val colorHex = extChar.avatarColorHex.removePrefix("#")
                     val colorInt = try {
                         android.graphics.Color.parseColor("#$colorHex")
@@ -791,19 +862,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                         0xFF6366F1.toInt()
                     }
 
-                    val charId = if (existing != null) {
-                        val updated = existing.copy(
-                            role = extChar.role,
-                            age = if (existing.age.isBlank()) extChar.age else existing.age,
-                            appearance = if (existing.appearance.isBlank()) extChar.appearance else existing.appearance,
-                            backstory = if (existing.backstory.isBlank()) extChar.backstory else existing.backstory,
-                            plotArc = if (existing.plotArc.isBlank()) extChar.plotArc else existing.plotArc,
-                            notes = if (existing.notes.isBlank()) extChar.notes else existing.notes,
-                            avatarColor = colorInt
-                        )
-                        repository.insertCharacter(updated)
-                        existing.id
-                    } else {
+                    if (existing == null) {
                         val newChar = CharacterProfile(
                             name = extChar.name,
                             role = extChar.role,
@@ -815,85 +874,192 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                             avatarColor = colorInt,
                             novelId = novelId
                         )
-                        repository.insertCharacter(newChar).toInt()
+                        changes.add(ProposedChange.NewCharacter(character = newChar))
+                    } else {
+                        // Check if any significant fields differ
+                        val diffs = mutableListOf<String>()
+                        if (existing.role != extChar.role) diffs.add("Role: ${existing.role} -> ${extChar.role}")
+                        if (existing.appearance.isBlank() && extChar.appearance.isNotBlank()) diffs.add("New appearance details")
+                        if (existing.backstory.isBlank() && extChar.backstory.isNotBlank()) diffs.add("New backstory details")
+                        if (existing.plotArc.isBlank() && extChar.plotArc.isNotBlank()) diffs.add("Updated plot arc")
+
+                        if (diffs.isNotEmpty()) {
+                            val updatedChar = existing.copy(
+                                role = extChar.role,
+                                appearance = if (existing.appearance.isBlank()) extChar.appearance else existing.appearance,
+                                backstory = if (existing.backstory.isBlank()) extChar.backstory else existing.backstory,
+                                plotArc = if (existing.plotArc.isBlank()) extChar.plotArc else existing.plotArc,
+                                notes = if (existing.notes.isBlank()) extChar.notes else existing.notes
+                            )
+                            changes.add(
+                                ProposedChange.UpdatedCharacter(
+                                    existingCharacter = existing,
+                                    updatedCharacter = updatedChar,
+                                    diffSummary = diffs.joinToString(", ")
+                                )
+                            )
+                        }
                     }
-                    characterIds[extChar.name.lowercase().trim()] = charId
                 }
 
-                // 2. Insert/Update Story Timeline Events (Plot milestones)
+                // 2. Proposed Story Events
                 extracted.plotEvents.forEach { extEvent ->
-                    val existing = allEvents.value.find {
-                        it.title.equals(extEvent.title, ignoreCase = true) && it.novelId == novelId
-                    }
-
-                    if (existing != null) {
-                        val updated = existing.copy(
-                            description = extEvent.description,
-                            arcPhase = extEvent.arcPhase,
-                            orderIndex = extEvent.orderIndex
-                        )
-                        repository.updateEvent(updated)
-                    } else {
+                    val existing = currentNovelEvents.find { it.title.equals(extEvent.title, ignoreCase = true) }
+                    if (existing == null) {
                         val newEvent = StoryEvent(
                             title = extEvent.title,
                             description = extEvent.description,
                             arcPhase = extEvent.arcPhase,
-                            orderIndex = extEvent.orderIndex,
+                            orderIndex = (currentNovelEvents.maxOfOrNull { it.orderIndex } ?: 0) + 1,
                             novelId = novelId
                         )
-                        repository.insertEvent(newEvent)
-                    }
-                }
-
-                // Wait a moment for DB updates to settle
-                delay(500)
-
-                // 3. Insert/Update Relationships (Connections)
-                val freshChars = repository.allCharacters.first()
-                val freshEvents = repository.allEvents.first()
-                
-                extracted.relationships.forEach { extRel ->
-                    val sourceChar = freshChars.find { 
-                        it.name.equals(extRel.sourceCharacter, ignoreCase = true) && it.novelId == novelId 
-                    } ?: return@forEach
-
-                    val targetId = if (extRel.isToEvent) {
-                        freshEvents.find { 
-                            it.title.equals(extRel.targetName, ignoreCase = true) && it.novelId == novelId 
-                        }?.id
-                    } else {
-                        freshChars.find { 
-                            it.name.equals(extRel.targetName, ignoreCase = true) && it.novelId == novelId 
-                        }?.id
-                    }
-
-                    if (targetId != null) {
-                        val existingRel = allRelationships.value.find {
-                            it.sourceCharacterId == sourceChar.id &&
-                            it.targetId == targetId &&
-                            it.isToEvent == extRel.isToEvent &&
-                            it.novelId == novelId
-                        }
-
-                        if (existingRel == null) {
-                            val rel = CharacterRelationship(
-                                sourceCharacterId = sourceChar.id,
-                                targetId = targetId,
-                                isToEvent = extRel.isToEvent,
-                                relationType = extRel.relationType,
-                                description = extRel.description,
-                                novelId = novelId
+                        changes.add(ProposedChange.NewStoryEvent(event = newEvent))
+                    } else if (existing.description != extEvent.description || existing.arcPhase != extEvent.arcPhase) {
+                        val updatedEvent = existing.copy(
+                            description = extEvent.description,
+                            arcPhase = extEvent.arcPhase
+                        )
+                        changes.add(
+                            ProposedChange.UpdatedStoryEvent(
+                                existingEvent = existing,
+                                updatedEvent = updatedEvent,
+                                diffSummary = "Phase: ${existing.arcPhase} -> ${extEvent.arcPhase}"
                             )
-                            repository.insertRelationship(rel)
+                        )
+                    }
+                }
+
+                // 3. Proposed Relationships
+                extracted.relationships.forEach { extRel ->
+                    val sourceChar = currentNovelChars.find { it.name.equals(extRel.sourceCharacter, ignoreCase = true) }
+                    if (sourceChar != null) {
+                        val targetId = if (extRel.isToEvent) {
+                            currentNovelEvents.find { it.title.equals(extRel.targetName, ignoreCase = true) }?.id
+                        } else {
+                            currentNovelChars.find { it.name.equals(extRel.targetName, ignoreCase = true) }?.id
+                        }
+
+                        if (targetId != null) {
+                            val existingRel = currentNovelRels.find {
+                                it.sourceCharacterId == sourceChar.id &&
+                                it.targetId == targetId &&
+                                it.isToEvent == extRel.isToEvent
+                            }
+                            if (existingRel == null) {
+                                val rel = CharacterRelationship(
+                                    sourceCharacterId = sourceChar.id,
+                                    targetId = targetId,
+                                    isToEvent = extRel.isToEvent,
+                                    relationType = extRel.relationType,
+                                    description = extRel.description,
+                                    novelId = novelId
+                                )
+                                changes.add(
+                                    ProposedChange.NewRelationship(
+                                        relationship = rel,
+                                        sourceName = sourceChar.name,
+                                        targetName = extRel.targetName
+                                    )
+                                )
+                            }
                         }
                     }
                 }
-                triggerAutoSync()
+
+                if (changes.isNotEmpty()) {
+                    _proposedChanges.value = changes
+                    _showReviewDialog.value = true
+                    _analysisStatusMessage.value = "Found ${changes.size} proposed story changes to review."
+                } else {
+                    _analysisStatusMessage.value = "Story analysis complete. No new characters or plot changes detected."
+                    // Save hash since no changes needed
+                    repository.updateLastAnalyzedHash(nodeId, contentHash)
+                }
             } catch (e: Exception) {
-                Log.e(TAG, "AI story tracker parsing failed: ${e.message}", e)
+                Log.e(TAG, "Story analysis failed: ${e.message}", e)
+                _analysisStatusMessage.value = "Analysis error: ${e.localizedMessage ?: "Unknown error"}"
             } finally {
                 _isAnalyzingStory.value = false
             }
         }
+    }
+
+    fun clearAnalysisStatusMessage() {
+        _analysisStatusMessage.value = null
+    }
+
+    // --- Review Workflow Actions ---
+    fun acceptProposedChange(change: ProposedChange) {
+        viewModelScope.launch {
+            when (change) {
+                is ProposedChange.NewCharacter -> {
+                    repository.insertCharacter(change.character)
+                }
+                is ProposedChange.UpdatedCharacter -> {
+                    repository.insertCharacter(change.updatedCharacter)
+                }
+                is ProposedChange.NewStoryEvent -> {
+                    repository.insertEvent(change.event)
+                }
+                is ProposedChange.UpdatedStoryEvent -> {
+                    repository.updateEvent(change.updatedEvent)
+                }
+                is ProposedChange.NewRelationship -> {
+                    repository.insertRelationship(change.relationship)
+                }
+            }
+            val remaining = _proposedChanges.value.filter { it.changeId != change.changeId }
+            _proposedChanges.value = remaining
+            if (remaining.isEmpty()) {
+                finishReviewProcess()
+            }
+        }
+    }
+
+    fun rejectProposedChange(change: ProposedChange) {
+        val remaining = _proposedChanges.value.filter { it.changeId != change.changeId }
+        _proposedChanges.value = remaining
+        if (remaining.isEmpty()) {
+            finishReviewProcess()
+        }
+    }
+
+    fun acceptAllProposedChanges() {
+        viewModelScope.launch {
+            _proposedChanges.value.forEach { change ->
+                when (change) {
+                    is ProposedChange.NewCharacter -> repository.insertCharacter(change.character)
+                    is ProposedChange.UpdatedCharacter -> repository.insertCharacter(change.updatedCharacter)
+                    is ProposedChange.NewStoryEvent -> repository.insertEvent(change.event)
+                    is ProposedChange.UpdatedStoryEvent -> repository.updateEvent(change.updatedEvent)
+                    is ProposedChange.NewRelationship -> repository.insertRelationship(change.relationship)
+                }
+            }
+            _proposedChanges.value = emptyList()
+            finishReviewProcess()
+        }
+    }
+
+    fun rejectAllProposedChanges() {
+        _proposedChanges.value = emptyList()
+        finishReviewProcess()
+    }
+
+    fun dismissReviewDialog() {
+        _showReviewDialog.value = false
+    }
+
+    private fun finishReviewProcess() {
+        _showReviewDialog.value = false
+        val nodeId = currentlyAnalyzingNodeId
+        val hash = currentlyAnalyzingHash
+        if (nodeId != null && hash != null) {
+            viewModelScope.launch {
+                repository.updateLastAnalyzedHash(nodeId, hash)
+            }
+        }
+        currentlyAnalyzingNodeId = null
+        currentlyAnalyzingHash = null
+        _lastSavedTimeText.value = "Story database updated"
     }
 }

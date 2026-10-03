@@ -42,8 +42,7 @@ fun StorylineTrackerScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) 
         topBar = {
             TopAppBar(
                 title = {
-                    val allNodes by viewModel.allNodes.collectAsState()
-                    val novels = remember(allNodes) { allNodes.filter { it.isFolder } }
+                    val novels by viewModel.rootNovels.collectAsState()
                     val activeNovel = remember(novels, selectedNovelId) { novels.find { it.id == selectedNovelId } }
                     var showDropdown by remember { mutableStateOf(false) }
 
@@ -264,7 +263,7 @@ fun StorylineTrackerScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) 
                                     modifier = Modifier.padding(16.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.CloudQueue,
+                                        imageVector = Icons.Default.History,
                                         contentDescription = null,
                                         modifier = Modifier.size(36.dp),
                                         tint = MaterialTheme.colorScheme.outline
