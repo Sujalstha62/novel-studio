@@ -21,7 +21,9 @@ data class GrammarSuggestion(
     val originalText: String,
     val suggestedText: String,
     val explanation: String,
-    val severity: String // "Critical" or "Style" or "Typos" or "Punctuation"
+    val severity: String, // "Critical" or "Style" or "Typos" or "Punctuation"
+    val startOffset: Int = -1,
+    val endOffset: Int = -1
 )
 
 // --- Request and Response Models for direct Gemini REST ---
@@ -108,6 +110,8 @@ class GeminiGrammarChecker {
             You must output a JSON array of objects. Each object represents a single suggestion and must have exactly the following keys:
             - "originalText": The exact word, phrase, or sentence in the input text that needs correction.
             - "suggestedText": Your proposed edit or improvement.
+            - "startOffset": The 0-based character start index of the exact originalText within the input text.
+            - "endOffset": The 0-based character end index (exclusive) of the exact originalText within the input text.
             - "explanation": A friendly, helpful, literary explanation of why this change is suggested (e.g., 'Eliminates passive voice', 'Corrects typo', 'Enriches vocabulary').
             - "severity": Must be exactly one of: "Critical", "Style", "Punctuation", "Typos".
 
@@ -134,7 +138,29 @@ class GeminiGrammarChecker {
                 Log.d(TAG, "Response JSON: $cleanedJson")
                 val type = Types.newParameterizedType(List::class.java, GrammarSuggestion::class.java)
                 val adapter = RetrofitClient.moshiInstance.adapter<List<GrammarSuggestion>>(type)
-                return@withContext adapter.fromJson(cleanedJson) ?: emptyList()
+                val parsed = adapter.fromJson(cleanedJson) ?: emptyList()
+
+                // Validate and align exact character offsets within input text
+                val alignedSuggestions = parsed.map { suggestion ->
+                    val orig = suggestion.originalText
+                    val sOffset = suggestion.startOffset
+                    val eOffset = suggestion.endOffset
+
+                    if (sOffset in 0..text.length && eOffset in sOffset..text.length &&
+                        text.substring(sOffset, eOffset) == orig
+                    ) {
+                        suggestion
+                    } else {
+                        // Locate the exact occurrence in the text
+                        val foundIndex = text.indexOf(orig)
+                        if (foundIndex >= 0) {
+                            suggestion.copy(startOffset = foundIndex, endOffset = foundIndex + orig.length)
+                        } else {
+                            suggestion
+                        }
+                    }
+                }
+                return@withContext alignedSuggestions
             } else {
                 Log.w(TAG, "No response candidates or empty content.")
                 return@withContext getLocalBackupSuggestions(text)
@@ -147,8 +173,7 @@ class GeminiGrammarChecker {
 
     /**
      * Fallback local regex-based and heuristic proofreader if offline or API key is not yet set.
-     * This ensures the application is 100% functional even in local mode, which complies with
-     * real, robust software practices!
+     * Computes exact startOffset and endOffset for each detected issue.
      */
     private fun getLocalBackupSuggestions(text: String): List<GrammarSuggestion> {
         val suggestions = mutableListOf<GrammarSuggestion>()
@@ -164,7 +189,9 @@ class GeminiGrammarChecker {
                     originalText = match.value,
                     suggestedText = "[Activate verb]",
                     explanation = "Passive voice detected. Try switching to an active verb to make the prose punchier and enhance the pacing.",
-                    severity = "Style"
+                    severity = "Style",
+                    startOffset = match.range.first,
+                    endOffset = match.range.last + 1
                 )
             )
         }
@@ -178,15 +205,16 @@ class GeminiGrammarChecker {
             "suddenly" to "usually dilutes tension; let the action happen abruptly on its own"
         )
         for ((filterWord, tip) in filters) {
-            val idx = text.indexOf(filterWord, ignoreCase = true)
-            if (idx >= 0) {
-                val exactText = text.substring(idx, idx + filterWord.length)
+            val filterRegex = Regex("\\b${Regex.escape(filterWord)}\\b", RegexOption.IGNORE_CASE)
+            filterRegex.findAll(text).forEach { match ->
                 suggestions.add(
                     GrammarSuggestion(
-                        originalText = exactText,
+                        originalText = match.value,
                         suggestedText = "[Filter word]",
                         explanation = "Filter word/cliché detected: '$filterWord'. $tip to pull the reader closer to the action.",
-                        severity = "Style"
+                        severity = "Style",
+                        startOffset = match.range.first,
+                        endOffset = match.range.last + 1
                     )
                 )
             }
@@ -204,15 +232,16 @@ class GeminiGrammarChecker {
             "there own" to "their own"
         )
         for ((wrong, right) in typoMap) {
-            val idx = text.indexOf(wrong, ignoreCase = true)
-            if (idx >= 0) {
-                val exactText = text.substring(idx, idx + wrong.length)
+            val typoRegex = Regex("\\b${Regex.escape(wrong)}\\b", RegexOption.IGNORE_CASE)
+            typoRegex.findAll(text).forEach { match ->
                 suggestions.add(
                     GrammarSuggestion(
-                        originalText = exactText,
+                        originalText = match.value,
                         suggestedText = right,
                         explanation = "Common spelling/typo correction.",
-                        severity = "Typos"
+                        severity = "Typos",
+                        startOffset = match.range.first,
+                        endOffset = match.range.last + 1
                     )
                 )
             }

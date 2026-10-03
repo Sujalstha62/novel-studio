@@ -26,9 +26,14 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.min
+import kotlin.math.PI
 import com.example.data.CharacterProfile
 import com.example.data.CharacterRelationship
 import com.example.data.StoryEvent
@@ -180,6 +185,8 @@ fun RelationshipMapScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                             modifier = Modifier.padding(bottom = 8.dp)
                         )
 
+                        var selectedCharId by remember { mutableStateOf<Int?>(null) }
+
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -194,112 +201,160 @@ fun RelationshipMapScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Text(
-                                        "Create characters in Profiles first to draw relationship lines.",
+                                        "No characters found for this novel.\nCreate character profiles to view the relationship graph.",
                                         style = MaterialTheme.typography.bodyMedium,
                                         textAlign = TextAlign.Center,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             } else {
-                                // Custom ER Schema Line Drawer Canvas
-                                // Let's draw schematic connection waves between imaginary grid anchors to simulate database ER links
-                                val primaryColor = MaterialTheme.colorScheme.primary
-                                val secondaryColor = MaterialTheme.colorScheme.secondary
-                                val tertiaryColor = MaterialTheme.colorScheme.tertiary
-
-                                Canvas(modifier = Modifier.fillMaxSize()) {
-                                    val width = size.width
-                                    val height = size.height
-
-                                    // Visual ER connection curves
-                                    relationships.forEachIndexed { index, rel ->
-                                        val offsetMultiplier = (index % 4) + 1
-                                        val startX = width * 0.2f
-                                        val startY = height * (0.2f + (index * 0.12f).coerceAtMost(0.6f))
-                                        val endX = width * 0.8f
-                                        val endY = if (rel.isToEvent) {
-                                            height * (0.3f + (index * 0.1f).coerceAtMost(0.5f))
-                                        } else {
-                                            height * (0.15f + (index * 0.15f).coerceAtMost(0.7f))
-                                        }
-
-                                        val pathColor = when (rel.relationType) {
-                                            "Protagonist", "Ally", "Friend" -> Color(0xFF10B981)
-                                            "Antagonist", "Rival", "Enemy" -> Color(0xFFEF4444)
-                                            "Sibling", "Family", "Lover" -> Color(0xFFEC4899)
-                                            else -> secondaryColor
-                                        }
-
-                                        // Draw modern ER path curves
-                                        drawLine(
-                                            color = pathColor.copy(alpha = 0.6f),
-                                            start = Offset(startX, startY),
-                                            end = Offset(endX, endY),
-                                            strokeWidth = 3f,
-                                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 10f), 0f)
-                                        )
-
-                                        drawCircle(
-                                            color = pathColor,
-                                            radius = 6f,
-                                            center = Offset(startX, startY)
-                                        )
-
-                                        drawCircle(
-                                            color = pathColor,
-                                            radius = 6f,
-                                            center = Offset(endX, endY)
-                                        )
-                                    }
-                                }
-
-                                // Overlay Interactive Floating Anchors/Badges for Characters and Milestones
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .padding(16.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween
+                                BoxWithConstraints(
+                                    modifier = Modifier.fillMaxSize()
                                 ) {
-                                    // Left list: Character profiles
-                                    Column(
-                                        verticalArrangement = Arrangement.spacedBy(16.dp),
-                                        modifier = Modifier
-                                            .fillMaxHeight()
-                                            .weight(1f),
-                                        horizontalAlignment = Alignment.Start
-                                    ) {
-                                        Text(
-                                            text = "CHARACTERS",
-                                            fontSize = 10.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                                        )
-                                        characters.take(5).forEach { char ->
-                                            val colorHex = char.avatarColor
-                                            val composeColor = Color(colorHex)
-                                            Card(
-                                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                                shape = RoundedCornerShape(8.dp),
-                                                modifier = Modifier
-                                                    .width(180.dp)
-                                                    .border(1.dp, composeColor.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
-                                                    .shadow(1.dp, RoundedCornerShape(8.dp))
-                                            ) {
-                                                Row(
-                                                    modifier = Modifier.padding(10.dp),
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    Box(
-                                                        modifier = Modifier
-                                                            .size(8.dp)
-                                                            .clip(CircleShape)
-                                                            .background(composeColor)
+                                    val density = androidx.compose.ui.platform.LocalDensity.current
+                                    val widthPx = with(density) { maxWidth.toPx() }
+                                    val heightPx = with(density) { maxHeight.toPx() }
+
+                                    val centerX = widthPx / 2f
+                                    val centerY = heightPx / 2f
+                                    val radius = (min(widthPx, heightPx) * 0.36f).coerceAtLeast(100f)
+
+                                    // 1. Calculate deterministic positions for character nodes
+                                    val characterPositions = remember(characters, widthPx, heightPx) {
+                                        characters.mapIndexed { index, char ->
+                                            if (characters.size == 1) {
+                                                char.id to Offset(centerX, centerY)
+                                            } else {
+                                                val angle = (2.0 * PI * index / characters.size) - PI / 2.0
+                                                val x = centerX + (radius * cos(angle)).toFloat()
+                                                val y = centerY + (radius * sin(angle)).toFloat()
+                                                char.id to Offset(x, y)
+                                            }
+                                        }.toMap()
+                                    }
+
+                                    // 2. Calculate positions for any events referenced by relationships
+                                    val referencedEventIds = remember(relationships) {
+                                        relationships.filter { it.isToEvent }.map { it.targetId }.distinct()
+                                    }
+                                    val referencedEvents = remember(events, referencedEventIds) {
+                                        events.filter { referencedEventIds.contains(it.id) }
+                                    }
+                                    val eventPositions = remember(referencedEvents, widthPx, heightPx) {
+                                        val eventRadius = radius * 0.5f
+                                        referencedEvents.mapIndexed { index, event ->
+                                            if (referencedEvents.size == 1) {
+                                                event.id to Offset(centerX, centerY)
+                                            } else {
+                                                val angle = (2.0 * PI * index / referencedEvents.size)
+                                                val x = centerX + (eventRadius * cos(angle)).toFloat()
+                                                val y = centerY + (eventRadius * sin(angle)).toFloat()
+                                                event.id to Offset(x, y)
+                                            }
+                                        }.toMap()
+                                    }
+
+                                    // 3. Draw actual data-driven edges for every database relationship
+                                    val primaryColor = MaterialTheme.colorScheme.primary
+
+                                    Canvas(modifier = Modifier.fillMaxSize()) {
+                                        relationships.forEach { rel ->
+                                            val startPos = characterPositions[rel.sourceCharacterId]
+                                            val endPos = if (rel.isToEvent) {
+                                                eventPositions[rel.targetId]
+                                            } else {
+                                                characterPositions[rel.targetId]
+                                            }
+
+                                            if (startPos != null && endPos != null) {
+                                                val isHighlighted = selectedCharId == null ||
+                                                        rel.sourceCharacterId == selectedCharId ||
+                                                        (!rel.isToEvent && rel.targetId == selectedCharId)
+
+                                                val alpha = if (isHighlighted) 0.85f else 0.15f
+                                                val strokeWidth = if (isHighlighted) 3.5f else 1.5f
+
+                                                val edgeColor = when (rel.relationType) {
+                                                    "Ally", "Friend", "Protagonist" -> Color(0xFF10B981)
+                                                    "Antagonist", "Rival", "Enemy" -> Color(0xFFEF4444)
+                                                    "Family", "Sibling", "Lover", "Adoptive Sibling" -> Color(0xFFEC4899)
+                                                    "Mentor" -> Color(0xFFF59E0B)
+                                                    else -> primaryColor
+                                                }
+
+                                                // Draw line connecting the actual nodes
+                                                drawLine(
+                                                    color = edgeColor.copy(alpha = alpha),
+                                                    start = startPos,
+                                                    end = endPos,
+                                                    strokeWidth = strokeWidth,
+                                                    pathEffect = if (rel.isToEvent) PathEffect.dashPathEffect(floatArrayOf(12f, 8f), 0f) else null
+                                                )
+
+                                                // Draw direction indicator dot towards target
+                                                val midOffset = Offset(
+                                                    x = startPos.x * 0.4f + endPos.x * 0.6f,
+                                                    y = startPos.y * 0.4f + endPos.y * 0.6f
+                                                )
+                                                drawCircle(
+                                                    color = edgeColor.copy(alpha = alpha),
+                                                    radius = 4.5f,
+                                                    center = midOffset
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    // 4. Render interactive nodes for characters
+                                    characters.forEach { char ->
+                                        val pos = characterPositions[char.id] ?: return@forEach
+                                        val isSelected = selectedCharId == char.id
+                                        val nodeColor = Color(char.avatarColor)
+
+                                        Box(
+                                            modifier = Modifier
+                                                .offset {
+                                                    IntOffset(
+                                                        x = (pos.x - 70.dp.toPx()).toInt().coerceAtLeast(4),
+                                                        y = (pos.y - 25.dp.toPx()).toInt().coerceAtLeast(4)
                                                     )
-                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                }
+                                                .width(140.dp)
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(MaterialTheme.colorScheme.surface)
+                                                .border(
+                                                    width = if (isSelected) 2.dp else 1.dp,
+                                                    color = if (isSelected) MaterialTheme.colorScheme.primary else nodeColor.copy(alpha = 0.5f),
+                                                    shape = RoundedCornerShape(10.dp)
+                                                )
+                                                .clickable {
+                                                    selectedCharId = if (selectedCharId == char.id) null else char.id
+                                                }
+                                                .padding(horizontal = 8.dp, vertical = 6.dp)
+                                        ) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(10.dp)
+                                                        .clip(CircleShape)
+                                                        .background(nodeColor)
+                                                )
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Column {
                                                     Text(
                                                         text = char.name,
-                                                        style = MaterialTheme.typography.bodySmall,
+                                                        style = MaterialTheme.typography.labelMedium,
                                                         fontWeight = FontWeight.Bold,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                    Text(
+                                                        text = char.role,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontSize = 9.sp,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                         maxLines = 1,
                                                         overflow = TextOverflow.Ellipsis
                                                     )
@@ -308,84 +363,82 @@ fun RelationshipMapScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                                         }
                                     }
 
-                                    Spacer(modifier = Modifier.width(20.dp))
+                                    // 5. Render nodes for referenced events
+                                    referencedEvents.forEach { event ->
+                                        val pos = eventPositions[event.id] ?: return@forEach
+                                        Box(
+                                            modifier = Modifier
+                                                .offset {
+                                                    IntOffset(
+                                                        x = (pos.x - 60.dp.toPx()).toInt().coerceAtLeast(4),
+                                                        y = (pos.y - 18.dp.toPx()).toInt().coerceAtLeast(4)
+                                                    )
+                                                }
+                                                .width(120.dp)
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f))
+                                                .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                                .padding(horizontal = 6.dp, vertical = 4.dp)
+                                        ) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Icon(
+                                                    Icons.Default.Flag,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(12.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = event.title,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontSize = 9.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                        }
+                                    }
 
-                                    // Right list: Targets (Characters or Events)
-                                    Column(
-                                        verticalArrangement = Arrangement.spacedBy(16.dp),
-                                        modifier = Modifier
-                                            .fillMaxHeight()
-                                            .weight(1f),
-                                        horizontalAlignment = Alignment.End
-                                    ) {
-                                        Text(
-                                            text = "DESTINATIONS & EVENTS",
-                                            fontSize = 10.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                                        )
-
-                                        if (events.isNotEmpty()) {
-                                            events.take(3).forEach { event ->
-                                                Card(
-                                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.2f)),
-                                                    shape = RoundedCornerShape(8.dp),
-                                                    modifier = Modifier
-                                                        .width(180.dp)
-                                                        .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
-                                                        .shadow(1.dp, RoundedCornerShape(8.dp))
-                                                ) {
+                                    // 6. Selected character info card if tapped
+                                    selectedCharId?.let { selId ->
+                                        val selChar = characters.find { it.id == selId }
+                                        if (selChar != null) {
+                                            val charRels = relationships.filter { it.sourceCharacterId == selId || (!it.isToEvent && it.targetId == selId) }
+                                            Card(
+                                                modifier = Modifier
+                                                    .align(Alignment.BottomCenter)
+                                                    .padding(12.dp)
+                                                    .fillMaxWidth(0.9f),
+                                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                                                shape = RoundedCornerShape(12.dp),
+                                                elevation = CardDefaults.cardElevation(4.dp)
+                                            ) {
+                                                Column(modifier = Modifier.padding(12.dp)) {
                                                     Row(
-                                                        modifier = Modifier.padding(10.dp),
+                                                        modifier = Modifier.fillMaxWidth(),
+                                                        horizontalArrangement = Arrangement.SpaceBetween,
                                                         verticalAlignment = Alignment.CenterVertically
                                                     ) {
-                                                        Icon(
-                                                            Icons.Default.Flag,
-                                                            contentDescription = null,
-                                                            tint = MaterialTheme.colorScheme.primary,
-                                                            modifier = Modifier.size(10.dp)
-                                                        )
-                                                        Spacer(modifier = Modifier.width(6.dp))
+                                                        Text(selChar.name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
+                                                        Text("${charRels.size} connection(s)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                                    }
+                                                    if (charRels.isNotEmpty()) {
+                                                        Spacer(modifier = Modifier.height(4.dp))
                                                         Text(
-                                                            text = event.title,
+                                                            text = charRels.joinToString(", ") { r ->
+                                                                val otherName = if (r.sourceCharacterId == selId) {
+                                                                    if (r.isToEvent) events.find { it.id == r.targetId }?.title ?: "Event"
+                                                                    else characters.find { it.id == r.targetId }?.name ?: "Character"
+                                                                } else {
+                                                                    characters.find { it.id == r.sourceCharacterId }?.name ?: "Character"
+                                                                }
+                                                                "${r.relationType} ($otherName)"
+                                                            },
                                                             style = MaterialTheme.typography.bodySmall,
-                                                            fontWeight = FontWeight.Bold,
-                                                            maxLines = 1,
-                                                            overflow = TextOverflow.Ellipsis
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant
                                                         )
                                                     }
-                                                }
-                                            }
-                                        }
-
-                                        characters.drop(1).take(2).forEach { char ->
-                                            val composeColor = Color(char.avatarColor)
-                                            Card(
-                                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                                shape = RoundedCornerShape(8.dp),
-                                                modifier = Modifier
-                                                    .width(180.dp)
-                                                    .border(1.dp, composeColor.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
-                                                    .shadow(1.dp, RoundedCornerShape(8.dp))
-                                            ) {
-                                                Row(
-                                                    modifier = Modifier.padding(10.dp),
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    Box(
-                                                        modifier = Modifier
-                                                            .size(8.dp)
-                                                            .clip(CircleShape)
-                                                            .background(composeColor)
-                                                    )
-                                                    Spacer(modifier = Modifier.width(6.dp))
-                                                    Text(
-                                                        text = char.name,
-                                                        style = MaterialTheme.typography.bodySmall,
-                                                        fontWeight = FontWeight.Bold,
-                                                        maxLines = 1,
-                                                        overflow = TextOverflow.Ellipsis
-                                                    )
                                                 }
                                             }
                                         }

@@ -1397,6 +1397,48 @@ fun NovelEditorScreen(viewModel: NovelViewModel) {
 
                                         Spacer(modifier = Modifier.height(8.dp))
 
+                                        val grammarError by viewModel.grammarErrorMessage.collectAsState()
+                                        if (grammarError != null) {
+                                            Surface(
+                                                color = MaterialTheme.colorScheme.errorContainer,
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(vertical = 4.dp)
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.padding(8.dp),
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Icon(
+                                                        Icons.Default.Warning,
+                                                        contentDescription = null,
+                                                        tint = MaterialTheme.colorScheme.error,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text(
+                                                        grammarError ?: "",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        fontSize = 11.sp,
+                                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                                        modifier = Modifier.weight(1f)
+                                                    )
+                                                    IconButton(
+                                                        onClick = { viewModel.clearGrammarErrorMessage() },
+                                                        modifier = Modifier.size(20.dp)
+                                                    ) {
+                                                        Icon(
+                                                            Icons.Default.Close,
+                                                            contentDescription = "Dismiss",
+                                                            modifier = Modifier.size(14.dp)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                        }
+
                                         if (grammarSuggestions.isEmpty()) {
                                             Text(
                                                 text = "No grammar issues found. Tap Check to scan your text using Gemini.",

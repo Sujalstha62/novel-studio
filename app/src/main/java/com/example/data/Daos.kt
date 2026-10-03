@@ -56,6 +56,9 @@ interface CharacterDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertCharacter(character: CharacterProfile): Long
 
+    @Update
+    suspend fun updateCharacter(character: CharacterProfile)
+
     @Delete
     suspend fun deleteCharacter(character: CharacterProfile)
 
@@ -106,6 +109,9 @@ interface CharacterRelationshipDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertRelationship(relationship: CharacterRelationship)
+
+    @Update
+    suspend fun updateRelationship(relationship: CharacterRelationship)
 
     @Delete
     suspend fun deleteRelationship(relationship: CharacterRelationship)

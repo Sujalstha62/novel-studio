@@ -33,6 +33,17 @@ sealed class ProposedChange {
         override val changeId: String = UUID.randomUUID().toString(),
         val relationship: CharacterRelationship,
         val sourceName: String,
+        val targetName: String,
+        val sourcePendingChangeId: String? = null,
+        val targetPendingChangeId: String? = null
+    ) : ProposedChange()
+
+    data class UpdatedRelationship(
+        override val changeId: String = UUID.randomUUID().toString(),
+        val existingRelationship: CharacterRelationship,
+        val updatedRelationship: CharacterRelationship,
+        val diffSummary: String,
+        val sourceName: String,
         val targetName: String
     ) : ProposedChange()
 }

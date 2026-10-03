@@ -403,12 +403,20 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // --- Grammar Checker ---
+    private val _grammarErrorMessage = MutableStateFlow<String?>(null)
+    val grammarErrorMessage: StateFlow<String?> = _grammarErrorMessage.asStateFlow()
+
+    fun clearGrammarErrorMessage() {
+        _grammarErrorMessage.value = null
+    }
+
     fun runGrammarCheck() {
         val currentText = _editorText.value
         if (currentText.isBlank()) return
 
         _isCheckingGrammar.value = true
         _grammarSuggestions.value = emptyList()
+        _grammarErrorMessage.value = null
 
         viewModelScope.launch {
             try {
@@ -422,16 +430,52 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun applyGrammarSuggestion(suggestion: GrammarSuggestion) {
+    /**
+     * Applies a grammar suggestion targeting its exact character offsets in the manuscript.
+     * Validates bounds and text at range to ensure no accidental modification of wrong occurrences.
+     * Never uses replaceFirst().
+     */
+    fun applyGrammarSuggestion(suggestion: GrammarSuggestion): Boolean {
         val currentText = _editorText.value
+        val start = suggestion.startOffset
+        val end = suggestion.endOffset
         val original = suggestion.originalText
         val replacement = suggestion.suggestedText
 
-        if (original.isBlank()) return
+        if (original.isBlank()) return false
 
-        val updatedText = currentText.replaceFirst(original, replacement)
+        // 1. Validate that the stored offset range is within bounds
+        if (start < 0 || end > currentText.length || start > end) {
+            _grammarErrorMessage.value = "Manuscript changed. Suggestion range is out of date. Please re-run grammar check."
+            return false
+        }
+
+        // 2. Verify that the text at that exact range matches the expected original text
+        val textAtRange = currentText.substring(start, end)
+        if (textAtRange != original) {
+            _grammarErrorMessage.value = "Manuscript text at this position was edited. Please re-run grammar check."
+            return false
+        }
+
+        // 3. Replace exactly that range (Never replaceFirst!)
+        val updatedText = currentText.substring(0, start) + replacement + currentText.substring(end)
         updateEditorText(updatedText)
-        _grammarSuggestions.value = _grammarSuggestions.value.filter { it != suggestion }
+
+        // 4. Adjust offsets of remaining suggestions based on text length delta
+        val delta = replacement.length - (end - start)
+        val remainingSuggestions = _grammarSuggestions.value
+            .filter { it != suggestion }
+            .mapNotNull { other ->
+                when {
+                    other.endOffset <= start -> other
+                    other.startOffset >= end -> other.copy(
+                        startOffset = other.startOffset + delta,
+                        endOffset = other.endOffset + delta
+                    )
+                    else -> null // Overlapping with the replaced range: discard
+                }
+            }
+        _grammarSuggestions.value = remainingSuggestions
 
         viewModelScope.launch {
             val currentActive = _activeNode.value
@@ -446,6 +490,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                 _lastSavedTimeText.value = "Suggestion applied & saved"
             }
         }
+        return true
     }
 
     // --- Character operations ---
@@ -534,6 +579,21 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // --- Safe File Export & Android Sharing System ---
+    fun escapeHtml(text: String): String {
+        return buildString(text.length) {
+            for (ch in text) {
+                when (ch) {
+                    '&' -> append("&amp;")
+                    '<' -> append("&lt;")
+                    '>' -> append("&gt;")
+                    '"' -> append("&quot;")
+                    '\'' -> append("&#39;")
+                    else -> append(ch)
+                }
+            }
+        }
+    }
+
     fun exportManuscript(context: Context, format: String, nodeId: Int?, novelId: Int? = _selectedNovelId.value): Uri? {
         val nodesList = allNodes.value
         val builder = java.lang.StringBuilder()
@@ -554,18 +614,19 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     builder.append(node.content)
                 }
                 "Professional HTML" -> {
+                    val safeName = escapeHtml(node.name)
                     builder.append("<!DOCTYPE html>\n<html>\n<head>\n")
                     builder.append("<meta charset=\"utf-8\">\n")
-                    builder.append("<title>${node.name}</title>\n")
+                    builder.append("<title>$safeName</title>\n")
                     builder.append("<style>\n")
                     builder.append("body { font-family: 'Garamond', 'Georgia', serif; line-height: 1.8; margin: 2in 1.5in; font-size: 12pt; color: #111; }\n")
                     builder.append("h1 { text-align: center; text-transform: uppercase; margin-bottom: 2em; }\n")
                     builder.append("p { text-indent: 0.5in; margin-bottom: 0; margin-top: 0; text-align: justify; }\n")
                     builder.append("</style>\n</head>\n<body>\n")
-                    builder.append("<h1>${node.name}</h1>\n")
+                    builder.append("<h1>$safeName</h1>\n")
                     node.content.split("\n\n").forEach { paragraph ->
                         if (paragraph.isNotBlank()) {
-                            builder.append("<p>${paragraph.trim()}</p>\n")
+                            builder.append("<p>${escapeHtml(paragraph.trim())}</p>\n")
                         }
                     }
                     builder.append("</body>\n</html>")
@@ -578,16 +639,17 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     builder.append("# ${novelTitle.uppercase()}\n\n")
                 }
                 "Professional HTML" -> {
+                    val safeNovelTitle = escapeHtml(novelTitle)
                     builder.append("<!DOCTYPE html>\n<html>\n<head>\n")
                     builder.append("<meta charset=\"utf-8\">\n")
-                    builder.append("<title>$novelTitle</title>\n")
+                    builder.append("<title>$safeNovelTitle</title>\n")
                     builder.append("<style>\n")
                     builder.append("body { font-family: 'Garamond', 'Georgia', serif; line-height: 1.8; margin: 2in 1.5in; font-size: 12pt; color: #111; }\n")
                     builder.append("h1.title { text-align: center; text-transform: uppercase; margin-top: 3in; margin-bottom: 3in; font-size: 28pt; }\n")
                     builder.append("h2 { text-align: center; margin-top: 2em; margin-bottom: 1em; page-break-before: always; }\n")
                     builder.append("p { text-indent: 0.5in; margin-bottom: 0; margin-top: 0; text-align: justify; }\n")
                     builder.append("</style>\n</head>\n<body>\n")
-                    builder.append("<h1 class=\"title\">$novelTitle</h1>\n")
+                    builder.append("<h1 class=\"title\">$safeNovelTitle</h1>\n")
                 }
                 else -> {
                     builder.append("==================================================\n")
@@ -672,7 +734,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
             if (format == "Creative Markdown (MD)") {
                 builder.append("\n" + "#".repeat(depth + 1) + " ${node.name}\n\n")
             } else if (format == "Professional HTML") {
-                builder.append("<h${depth + 1} style=\"text-align: center;\">${node.name}</h${depth + 1}>\n")
+                builder.append("<h${depth + 1} style=\"text-align: center;\">${escapeHtml(node.name)}</h${depth + 1}>\n")
             } else {
                 builder.append("\n=== ${node.name.uppercase()} ===\n\n")
             }
@@ -694,10 +756,10 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     builder.append("\n\n")
                 }
                 "Professional HTML" -> {
-                    builder.append("<h2>${node.name}</h2>\n")
+                    builder.append("<h2>${escapeHtml(node.name)}</h2>\n")
                     node.content.split("\n\n").forEach { paragraph ->
                         if (paragraph.isNotBlank()) {
-                            builder.append("<p>${paragraph.trim()}</p>\n")
+                            builder.append("<p>${escapeHtml(paragraph.trim())}</p>\n")
                         }
                     }
                     builder.append("\n")
@@ -929,39 +991,123 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                // 3. Proposed Relationships
+                // 3. Proposed Relationships (Evaluating merged context of existing + newly proposed characters)
+                val proposedNewChars = changes.filterIsInstance<ProposedChange.NewCharacter>()
+                val proposedNewEvents = changes.filterIsInstance<ProposedChange.NewStoryEvent>()
+
                 extracted.relationships.forEach { extRel ->
-                    val sourceChar = currentNovelChars.find { it.name.equals(extRel.sourceCharacter, ignoreCase = true) }
-                    if (sourceChar != null) {
-                        val targetId = if (extRel.isToEvent) {
-                            currentNovelEvents.find { it.title.equals(extRel.targetName, ignoreCase = true) }?.id
-                        } else {
-                            currentNovelChars.find { it.name.equals(extRel.targetName, ignoreCase = true) }?.id
+                    // Resolve Source character (existing in DB or newly proposed in this pass)
+                    val existingSource = currentNovelChars.find { it.name.equals(extRel.sourceCharacter, ignoreCase = true) }
+                    val pendingSource = if (existingSource == null) proposedNewChars.find { it.character.name.equals(extRel.sourceCharacter, ignoreCase = true) } else null
+
+                    val sourceId = existingSource?.id ?: 0
+                    val sourceName = existingSource?.name ?: pendingSource?.character?.name
+                    val sourcePendingId = pendingSource?.changeId
+
+                    if (sourceName == null) return@forEach // Source character unknown, skip
+
+                    // Resolve Target (existing in DB or newly proposed in this pass)
+                    val targetId: Int
+                    val targetName: String?
+                    val targetPendingId: String?
+
+                    if (extRel.isToEvent) {
+                        val existingTargetEvent = currentNovelEvents.find { it.title.equals(extRel.targetName, ignoreCase = true) }
+                        val pendingTargetEvent = if (existingTargetEvent == null) proposedNewEvents.find { it.event.title.equals(extRel.targetName, ignoreCase = true) } else null
+                        targetId = existingTargetEvent?.id ?: 0
+                        targetName = existingTargetEvent?.title ?: pendingTargetEvent?.event?.title
+                        targetPendingId = pendingTargetEvent?.changeId
+                    } else {
+                        val existingTargetChar = currentNovelChars.find { it.name.equals(extRel.targetName, ignoreCase = true) }
+                        val pendingTargetChar = if (existingTargetChar == null) proposedNewChars.find { it.character.name.equals(extRel.targetName, ignoreCase = true) } else null
+                        targetId = existingTargetChar?.id ?: 0
+                        targetName = existingTargetChar?.name ?: pendingTargetChar?.character?.name
+                        targetPendingId = pendingTargetChar?.changeId
+                    }
+
+                    if (targetName == null) return@forEach // Target unknown, skip
+
+                    // Check whether relationship already exists in the database
+                    if (sourcePendingId == null && targetPendingId == null) {
+                        val existingRel = currentNovelRels.find {
+                            it.sourceCharacterId == sourceId &&
+                            it.targetId == targetId &&
+                            it.isToEvent == extRel.isToEvent
                         }
 
-                        if (targetId != null) {
-                            val existingRel = currentNovelRels.find {
-                                it.sourceCharacterId == sourceChar.id &&
-                                it.targetId == targetId &&
-                                it.isToEvent == extRel.isToEvent
-                            }
-                            if (existingRel == null) {
-                                val rel = CharacterRelationship(
-                                    sourceCharacterId = sourceChar.id,
-                                    targetId = targetId,
-                                    isToEvent = extRel.isToEvent,
-                                    relationType = extRel.relationType,
-                                    description = extRel.description,
-                                    novelId = novelId
+                        if (existingRel == null) {
+                            // Case A: Relationship does not exist
+                            val rel = CharacterRelationship(
+                                sourceCharacterId = sourceId,
+                                targetId = targetId,
+                                isToEvent = extRel.isToEvent,
+                                relationType = extRel.relationType,
+                                description = extRel.description,
+                                novelId = novelId
+                            )
+                            changes.add(
+                                ProposedChange.NewRelationship(
+                                    relationship = rel,
+                                    sourceName = sourceName,
+                                    targetName = targetName
                                 )
+                            )
+                        } else {
+                            // Case B: Relationship exists and is materially different
+                            val isDifferentType = !existingRel.relationType.equals(extRel.relationType, ignoreCase = true)
+                            val isDifferentDesc = extRel.description.isNotBlank() && existingRel.description != extRel.description
+
+                            if (isDifferentType || isDifferentDesc) {
+                                val updatedRel = existingRel.copy(
+                                    relationType = extRel.relationType,
+                                    description = if (extRel.description.isNotBlank()) extRel.description else existingRel.description
+                                )
+                                val diff = if (isDifferentType && isDifferentDesc) {
+                                    "Type: ${existingRel.relationType} -> ${extRel.relationType}, Description updated"
+                                } else if (isDifferentType) {
+                                    "Type: ${existingRel.relationType} -> ${extRel.relationType}"
+                                } else {
+                                    "Description updated"
+                                }
                                 changes.add(
-                                    ProposedChange.NewRelationship(
-                                        relationship = rel,
-                                        sourceName = sourceChar.name,
-                                        targetName = extRel.targetName
+                                    ProposedChange.UpdatedRelationship(
+                                        existingRelationship = existingRel,
+                                        updatedRelationship = updatedRel,
+                                        diffSummary = diff,
+                                        sourceName = sourceName,
+                                        targetName = targetName
                                     )
                                 )
                             }
+                            // Case C: Relationship is unchanged -> Do nothing
+                        }
+                    } else {
+                        // Case A involving newly proposed characters:
+                        // Prevent duplicate proposed relationships between the same pair in this pass
+                        val alreadyProposed = changes.filterIsInstance<ProposedChange.NewRelationship>().any {
+                            it.sourceName.equals(sourceName, ignoreCase = true) &&
+                            it.targetName.equals(targetName, ignoreCase = true) &&
+                            it.relationship.isToEvent == extRel.isToEvent
+                        }
+
+                        if (!alreadyProposed) {
+                            val rel = CharacterRelationship(
+                                sourceCharacterId = sourceId,
+                                targetId = targetId,
+                                isToEvent = extRel.isToEvent,
+                                relationType = extRel.relationType,
+                                description = extRel.description,
+                                novelId = novelId
+                            )
+                            changes.add(
+                                ProposedChange.NewRelationship(
+                                    relationship = rel,
+                                    sourceName = sourceName,
+                                    targetName = targetName,
+                                    sourcePendingChangeId = sourcePendingId,
+                                    targetPendingChangeId = targetPendingId
+                                )
+                            )
                         }
                     }
                 }
@@ -993,31 +1139,90 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             when (change) {
                 is ProposedChange.NewCharacter -> {
-                    repository.insertCharacter(change.character)
+                    val newId = repository.insertCharacter(change.character).toInt()
+                    // Update any pending relationships that depend on this newly created character
+                    val updatedChanges = _proposedChanges.value.map { other ->
+                        if (other is ProposedChange.NewRelationship) {
+                            var updatedRel = other.relationship
+                            var updatedSourcePending = other.sourcePendingChangeId
+                            var updatedTargetPending = other.targetPendingChangeId
+
+                            if (other.sourcePendingChangeId == change.changeId) {
+                                updatedRel = updatedRel.copy(sourceCharacterId = newId)
+                                updatedSourcePending = null
+                            }
+                            if (!other.relationship.isToEvent && other.targetPendingChangeId == change.changeId) {
+                                updatedRel = updatedRel.copy(targetId = newId)
+                                updatedTargetPending = null
+                            }
+                            other.copy(
+                                relationship = updatedRel,
+                                sourcePendingChangeId = updatedSourcePending,
+                                targetPendingChangeId = updatedTargetPending
+                            )
+                        } else {
+                            other
+                        }
+                    }
+                    _proposedChanges.value = updatedChanges.filter { it.changeId != change.changeId }
                 }
                 is ProposedChange.UpdatedCharacter -> {
-                    repository.insertCharacter(change.updatedCharacter)
+                    repository.updateCharacter(change.updatedCharacter)
+                    _proposedChanges.value = _proposedChanges.value.filter { it.changeId != change.changeId }
                 }
                 is ProposedChange.NewStoryEvent -> {
-                    repository.insertEvent(change.event)
+                    val newId = repository.insertEvent(change.event).toInt()
+                    // Update any pending relationships pointing to this event
+                    val updatedChanges = _proposedChanges.value.map { other ->
+                        if (other is ProposedChange.NewRelationship && other.relationship.isToEvent && other.targetPendingChangeId == change.changeId) {
+                            other.copy(
+                                relationship = other.relationship.copy(targetId = newId),
+                                targetPendingChangeId = null
+                            )
+                        } else {
+                            other
+                        }
+                    }
+                    _proposedChanges.value = updatedChanges.filter { it.changeId != change.changeId }
                 }
                 is ProposedChange.UpdatedStoryEvent -> {
                     repository.updateEvent(change.updatedEvent)
+                    _proposedChanges.value = _proposedChanges.value.filter { it.changeId != change.changeId }
                 }
                 is ProposedChange.NewRelationship -> {
+                    // Ensure source and target characters exist before inserting to avoid broken foreign keys
+                    if (change.sourcePendingChangeId != null || change.targetPendingChangeId != null) {
+                        _analysisStatusMessage.value = "Cannot add relationship '${change.sourceName} -> ${change.targetName}' until its pending character(s) are accepted."
+                        return@launch
+                    }
                     repository.insertRelationship(change.relationship)
+                    _proposedChanges.value = _proposedChanges.value.filter { it.changeId != change.changeId }
+                }
+                is ProposedChange.UpdatedRelationship -> {
+                    repository.updateRelationship(change.updatedRelationship)
+                    _proposedChanges.value = _proposedChanges.value.filter { it.changeId != change.changeId }
                 }
             }
-            val remaining = _proposedChanges.value.filter { it.changeId != change.changeId }
-            _proposedChanges.value = remaining
-            if (remaining.isEmpty()) {
+
+            if (_proposedChanges.value.isEmpty()) {
                 finishReviewProcess()
             }
         }
     }
 
     fun rejectProposedChange(change: ProposedChange) {
-        val remaining = _proposedChanges.value.filter { it.changeId != change.changeId }
+        // If rejecting a NewCharacter or NewStoryEvent, also discard any dependent relationships
+        // so invalid foreign keys pointing to nonexistent characters are never created
+        val discardedChangeIds = mutableSetOf(change.changeId)
+        _proposedChanges.value.forEach { other ->
+            if (other is ProposedChange.NewRelationship) {
+                if (other.sourcePendingChangeId == change.changeId || other.targetPendingChangeId == change.changeId) {
+                    discardedChangeIds.add(other.changeId)
+                }
+            }
+        }
+
+        val remaining = _proposedChanges.value.filter { !discardedChangeIds.contains(it.changeId) }
         _proposedChanges.value = remaining
         if (remaining.isEmpty()) {
             finishReviewProcess()
@@ -1026,17 +1231,16 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
 
     fun acceptAllProposedChanges() {
         viewModelScope.launch {
-            _proposedChanges.value.forEach { change ->
-                when (change) {
-                    is ProposedChange.NewCharacter -> repository.insertCharacter(change.character)
-                    is ProposedChange.UpdatedCharacter -> repository.insertCharacter(change.updatedCharacter)
-                    is ProposedChange.NewStoryEvent -> repository.insertEvent(change.event)
-                    is ProposedChange.UpdatedStoryEvent -> repository.updateEvent(change.updatedEvent)
-                    is ProposedChange.NewRelationship -> repository.insertRelationship(change.relationship)
-                }
+            val currentChanges = _proposedChanges.value
+            val result = repository.applyProposedChangesAtomically(currentChanges)
+            if (result.isSuccess) {
+               _proposedChanges.value = emptyList()
+               finishReviewProcess()
+            } else {
+               Log.e(TAG, "Accept All transaction failed: ${result.exceptionOrNull()?.message}")
+               _analysisStatusMessage.value = "Failed to apply changes: ${result.exceptionOrNull()?.localizedMessage ?: "Transaction rolled back"}"
+               // Changes preserved for retry
             }
-            _proposedChanges.value = emptyList()
-            finishReviewProcess()
         }
     }
 

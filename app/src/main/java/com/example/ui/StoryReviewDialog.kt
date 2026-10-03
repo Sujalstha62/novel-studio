@@ -300,6 +300,21 @@ fun ProposedChangeCard(
                             fontWeight = FontWeight.SemiBold
                         )
                     }
+                    if (change.sourcePendingChangeId != null || change.targetPendingChangeId != null) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f)
+                        ) {
+                            Text(
+                                text = "New Character Link",
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.tertiary,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
@@ -327,6 +342,49 @@ fun ProposedChangeCard(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                }
+                is ProposedChange.UpdatedRelationship -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CategoryBadge(text = "RELATIONSHIP UPDATE", color = Color(0xFFF59E0B))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = change.diffSummary,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = change.sourceName,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Icon(
+                            Icons.Default.ArrowForward,
+                            contentDescription = "to",
+                            modifier = Modifier.padding(horizontal = 6.dp).size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = change.targetName,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Current: ${change.existingRelationship.relationType}${if (change.existingRelationship.description.isNotBlank()) " — ${change.existingRelationship.description}" else ""}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                    )
+                    Text(
+                        text = "Proposed: ${change.updatedRelationship.relationType}${if (change.updatedRelationship.description.isNotBlank()) " — ${change.updatedRelationship.description}" else ""}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
                 }
             }
 

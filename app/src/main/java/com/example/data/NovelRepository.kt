@@ -51,7 +51,7 @@ class NovelRepository(
             queue.add(node.id)
 
             while (queue.isNotEmpty()) {
-                val currentId = queue.poll()
+                val currentId = queue.poll() ?: continue
                 nodesToDelete.add(currentId)
                 val children = allExistingNodes.filter { it.parentId == currentId }
                 for (child in children) {
@@ -79,6 +79,7 @@ class NovelRepository(
 
     suspend fun getCharacterById(id: Int): CharacterProfile? = characterDao.getCharacterById(id)
     suspend fun insertCharacter(character: CharacterProfile): Long = characterDao.insertCharacter(character)
+    suspend fun updateCharacter(character: CharacterProfile) = characterDao.updateCharacter(character)
     suspend fun deleteCharacter(character: CharacterProfile) {
         database.withTransaction {
             characterRelationshipDao.deleteRelationshipsForCharacter(character.id)
@@ -106,21 +107,97 @@ class NovelRepository(
 
     // Relationships
     suspend fun insertRelationship(relationship: CharacterRelationship) = characterRelationshipDao.insertRelationship(relationship)
+    suspend fun updateRelationship(relationship: CharacterRelationship) = characterRelationshipDao.updateRelationship(relationship)
     suspend fun deleteRelationship(relationship: CharacterRelationship) = characterRelationshipDao.deleteRelationship(relationship)
 
     /**
-     * Repairs any legacy or seeded records where novelId was null, associating them
-     * with the default root novel so they are not orphaned.
+     * Atomically commits all accepted proposed changes within a single Room database transaction.
+     * Preserves entity dependencies, updates existing entities via @Update, and maps newly generated
+     * character/event IDs for dependent relationships. If an error occurs, the entire transaction rolls back.
+     */
+    suspend fun applyProposedChangesAtomically(changes: List<ProposedChange>): Result<Unit> = runCatching {
+        database.withTransaction {
+            val insertedCharIds = mutableMapOf<String, Int>()
+            val insertedEventIds = mutableMapOf<String, Int>()
+
+            // 1. Insert New Characters
+            for (change in changes.filterIsInstance<ProposedChange.NewCharacter>()) {
+                val newId = characterDao.insertCharacter(change.character).toInt()
+                insertedCharIds[change.changeId] = newId
+            }
+
+            // 2. Update Existing Characters via proper DAO @Update
+            for (change in changes.filterIsInstance<ProposedChange.UpdatedCharacter>()) {
+                characterDao.updateCharacter(change.updatedCharacter)
+            }
+
+            // 3. Insert New Story Events
+            for (change in changes.filterIsInstance<ProposedChange.NewStoryEvent>()) {
+                val newId = storyEventDao.insertEvent(change.event).toInt()
+                insertedEventIds[change.changeId] = newId
+            }
+
+            // 4. Update Existing Story Events via proper DAO @Update
+            for (change in changes.filterIsInstance<ProposedChange.UpdatedStoryEvent>()) {
+                storyEventDao.updateEvent(change.updatedEvent)
+            }
+
+            // 5. Insert New Relationships with resolved IDs
+            for (change in changes.filterIsInstance<ProposedChange.NewRelationship>()) {
+                val sourceId = if (change.sourcePendingChangeId != null) {
+                    insertedCharIds[change.sourcePendingChangeId] ?: change.relationship.sourceCharacterId
+                } else {
+                    change.relationship.sourceCharacterId
+                }
+
+                val targetId = if (change.targetPendingChangeId != null) {
+                    if (change.relationship.isToEvent) {
+                        insertedEventIds[change.targetPendingChangeId] ?: change.relationship.targetId
+                    } else {
+                        insertedCharIds[change.targetPendingChangeId] ?: change.relationship.targetId
+                    }
+                } else {
+                    change.relationship.targetId
+                }
+
+                if (sourceId > 0 && targetId > 0) {
+                    characterRelationshipDao.insertRelationship(
+                        change.relationship.copy(
+                            sourceCharacterId = sourceId,
+                            targetId = targetId
+                        )
+                    )
+                } else {
+                    android.util.Log.w("NovelRepository", "Skipped proposed relationship '${change.sourceName} -> ${change.targetName}': required character was not created.")
+                }
+            }
+
+            // 6. Update Existing Relationships via proper DAO @Update
+            for (change in changes.filterIsInstance<ProposedChange.UpdatedRelationship>()) {
+                characterRelationshipDao.updateRelationship(change.updatedRelationship)
+            }
+        }
+    }
+
+    /**
+     * Conservatively and idempotently repairs legacy records where novelId was null.
+     * If exactly one root novel exists, assigns orphaned records to that novel.
+     * If multiple root novels exist, does NOT arbitrarily assign records, leaving ambiguous
+     * records unassigned so user lore is never moved across novels.
      */
     suspend fun repairMissingNovelAssociations() {
         val allNodesList = manuscriptDao.getAllNodesList()
-        val defaultNovel = allNodesList.firstOrNull { it.parentId == null && it.isFolder }
-        if (defaultNovel != null) {
+        val rootNovels = allNodesList.filter { it.parentId == null && it.isFolder }
+        if (rootNovels.size == 1) {
+            val singleNovel = rootNovels.first()
             database.withTransaction {
-                characterDao.updateMissingNovelId(defaultNovel.id)
-                storyEventDao.updateMissingNovelId(defaultNovel.id)
-                characterRelationshipDao.updateMissingNovelId(defaultNovel.id)
+                characterDao.updateMissingNovelId(singleNovel.id)
+                storyEventDao.updateMissingNovelId(singleNovel.id)
+                characterRelationshipDao.updateMissingNovelId(singleNovel.id)
             }
+        } else {
+            // Multiple root novels exist: leave unassigned to avoid cross-novel contamination
+            android.util.Log.i("NovelRepository", "Multiple root novels detected (${rootNovels.size}); leaving ambiguous unassigned records untouched.")
         }
     }
 
