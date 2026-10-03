@@ -1,0 +1,6 @@
+{
+  "name": "Novel Writer",
+  "description": "An immersive, AI-assisted manuscript editor and novel planning workspace with distraction-free writing, real-time grammar checks, character profile management, and nested manuscript hierarchy.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
