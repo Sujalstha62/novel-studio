@@ -140,27 +140,7 @@ class GeminiGrammarChecker {
                 val adapter = RetrofitClient.moshiInstance.adapter<List<GrammarSuggestion>>(type)
                 val parsed = adapter.fromJson(cleanedJson) ?: emptyList()
 
-                // Validate and align exact character offsets within input text
-                val alignedSuggestions = parsed.map { suggestion ->
-                    val orig = suggestion.originalText
-                    val sOffset = suggestion.startOffset
-                    val eOffset = suggestion.endOffset
-
-                    if (sOffset in 0..text.length && eOffset in sOffset..text.length &&
-                        text.substring(sOffset, eOffset) == orig
-                    ) {
-                        suggestion
-                    } else {
-                        // Locate the exact occurrence in the text
-                        val foundIndex = text.indexOf(orig)
-                        if (foundIndex >= 0) {
-                            suggestion.copy(startOffset = foundIndex, endOffset = foundIndex + orig.length)
-                        } else {
-                            suggestion
-                        }
-                    }
-                }
-                return@withContext alignedSuggestions
+                return@withContext validateSuggestions(text, parsed)
             } else {
                 Log.w(TAG, "No response candidates or empty content.")
                 return@withContext getLocalBackupSuggestions(text)
@@ -168,6 +148,33 @@ class GeminiGrammarChecker {
         } catch (e: Exception) {
             Log.e(TAG, "Error calling Gemini API: ${e.message}", e)
             return@withContext getLocalBackupSuggestions(text)
+        }
+    }
+
+    /**
+     * Strictly validates grammar suggestions against the manuscript text.
+     * Any suggestion with missing, invalid, out-of-bounds, or mismatched startOffset/endOffset
+     * is discarded rather than guessing an occurrence via indexOf() or replaceFirst().
+     */
+    fun validateSuggestions(text: String, candidates: List<GrammarSuggestion>): List<GrammarSuggestion> {
+        return candidates.filter { suggestion ->
+            val orig = suggestion.originalText
+            val sOffset = suggestion.startOffset
+            val eOffset = suggestion.endOffset
+
+            val isValid = orig.isNotEmpty() &&
+                sOffset >= 0 &&
+                eOffset <= text.length &&
+                sOffset < eOffset &&
+                text.substring(sOffset, eOffset) == orig
+
+            if (!isValid) {
+                Log.w(
+                    TAG,
+                    "Discarding invalid grammar suggestion for '$orig': range [$sOffset, $eOffset] is invalid or does not match manuscript text."
+                )
+            }
+            isValid
         }
     }
 
@@ -247,6 +254,6 @@ class GeminiGrammarChecker {
             }
         }
 
-        return suggestions
+        return validateSuggestions(text, suggestions)
     }
 }

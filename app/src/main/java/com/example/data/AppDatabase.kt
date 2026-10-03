@@ -33,6 +33,12 @@ abstract class AppDatabase : RoomDatabase() {
 
     companion object {
         private const val TAG = "AppDatabase"
+        private const val DATABASE_NAME = "novel_writer_database"
+        private const val CURRENT_DB_VERSION = 3
+
+        @Volatile
+        var lastBackupResult: Result<File?>? = null
+            private set
 
         /**
          * Checks whether a specific column exists in a given SQLite table.
@@ -95,12 +101,21 @@ abstract class AppDatabase : RoomDatabase() {
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 // Perform safety backup with WAL checkpoint before opening/migrating database
-                backupDatabaseSafely(context)
+                val backupResult = backupDatabaseSafely(context)
+                lastBackupResult = backupResult
+                if (backupResult.isFailure) {
+                    val err = backupResult.exceptionOrNull()
+                    Log.e(
+                        TAG,
+                        "CRITICAL: Pre-migration local database backup failed: ${err?.message}",
+                        err
+                    )
+                }
 
                 val instance = Room.databaseBuilder(
                     context.applicationContext,
                     AppDatabase::class.java,
-                    "novel_writer_database"
+                    DATABASE_NAME
                 )
                 .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                 // NEVER use destructive migration for user manuscript data!
@@ -111,52 +126,150 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
-         * Checkpoints any pending SQLite Write-Ahead Log (WAL) data and creates a consistent
-         * backup of the database files (.db, -wal, -shm) prior to executing schema migrations.
-         * This provides practical protection against unexpected migration failures.
+         * Safely checkpoints any pending SQLite Write-Ahead Log (WAL) data and creates a consistent,
+         * recoverable local backup set inside a uniquely named backup directory prior to schema migrations.
+         *
+         * - Flushes pending WAL frames via PRAGMA wal_checkpoint(FULL)
+         * - Creates a uniquely named directory under filesDir/database_backups so existing backups are never overwritten
+         * - Preserves the primary database file along with any WAL/SHM/journal files required for recovery
+         * - Verifies every copied file's existence and byte length
+         * - Reports any backup failure explicitly via Result.failure and error logs rather than pretending success
          */
-        private fun backupDatabaseSafely(context: Context) {
-            try {
-                val dbFile = context.getDatabasePath("novel_writer_database")
-                if (dbFile != null && dbFile.exists() && dbFile.length() > 0) {
-                    // 1. Attempt WAL checkpoint flush to write pending log pages into the database file
-                    try {
-                        android.database.sqlite.SQLiteDatabase.openDatabase(
-                            dbFile.path,
-                            null,
-                            android.database.sqlite.SQLiteDatabase.OPEN_READWRITE
-                        ).use { tempDb ->
-                            tempDb.rawQuery("PRAGMA wal_checkpoint(FULL)", null).use { cursor ->
-                                if (cursor.moveToFirst()) {
-                                    Log.d(TAG, "WAL checkpoint completed: busy=${cursor.getInt(0)}, log=${cursor.getInt(1)}, checkpointed=${cursor.getInt(2)}")
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "WAL checkpoint before backup completed with notice: ${e.message}")
-                    }
-
-                    // 2. Safely copy the database file and any active journal files to backups directory
-                    val backupDir = File(context.filesDir, "database_backups").apply { mkdirs() }
-                    val filesToBackup = listOf(
-                        dbFile to File(backupDir, "novel_writer_database_preupgrade.bak"),
-                        File(dbFile.path + "-wal") to File(backupDir, "novel_writer_database_preupgrade.bak-wal"),
-                        File(dbFile.path + "-shm") to File(backupDir, "novel_writer_database_preupgrade.bak-shm")
-                    )
-
-                    for ((src, dest) in filesToBackup) {
-                        if (src.exists() && src.length() > 0) {
-                            FileInputStream(src).use { input ->
-                                FileOutputStream(dest).use { output ->
-                                    input.copyTo(output)
-                                }
-                            }
-                        }
-                    }
-                    Log.i(TAG, "Pre-migration database backup created successfully at ${backupDir.absolutePath}")
+        fun backupDatabaseSafely(context: Context): Result<File?> {
+            return try {
+                val dbFile = context.getDatabasePath(DATABASE_NAME)
+                if (dbFile == null || !dbFile.exists() || dbFile.length() == 0L) {
+                    return Result.success(null)
                 }
+
+                var existingVersion = 0
+                var walCheckpointBusy = false
+
+                // 1. Safely checkpoint/flush the SQLite WAL before copying files
+                try {
+                    android.database.sqlite.SQLiteDatabase.openDatabase(
+                        dbFile.path,
+                        null,
+                        android.database.sqlite.SQLiteDatabase.OPEN_READWRITE
+                    ).use { tempDb ->
+                        existingVersion = tempDb.version
+                        tempDb.rawQuery("PRAGMA wal_checkpoint(FULL)", null).use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                val busy = cursor.getInt(0)
+                                val logFrames = cursor.getInt(1)
+                                val checkpointedFrames = cursor.getInt(2)
+                                walCheckpointBusy = (busy != 0)
+                                if (walCheckpointBusy) {
+                                    Log.w(
+                                        TAG,
+                                        "WAL checkpoint reported busy=$busy (log=$logFrames, checkpointed=$checkpointedFrames); active WAL/SHM files will be preserved for recovery."
+                                    )
+                                } else {
+                                    Log.d(
+                                        TAG,
+                                        "WAL checkpoint completed cleanly: busy=$busy, log=$logFrames, checkpointed=$checkpointedFrames"
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    walCheckpointBusy = true
+                    Log.w(
+                        TAG,
+                        "Could not run direct WAL checkpoint before backup (${e.message}); preserving all WAL/SHM/journal recovery files."
+                    )
+                }
+
+                // 2. Create a uniquely named backup directory without ever overwriting an existing backup
+                val backupsRoot = File(context.filesDir, "database_backups")
+                if (!backupsRoot.exists() && !backupsRoot.mkdirs()) {
+                    throw java.io.IOException("Failed to create root backup directory at ${backupsRoot.absolutePath}")
+                }
+
+                val timestamp = System.currentTimeMillis()
+                val versionLabel = if (existingVersion > 0) "v${existingVersion}_to_v$CURRENT_DB_VERSION" else "v_to_v$CURRENT_DB_VERSION"
+                var uniqueBackupDir: File
+                var attempt = 0
+                do {
+                    val token = java.util.UUID.randomUUID().toString().take(8)
+                    val dirName = if (attempt == 0) {
+                        "backup_${versionLabel}_${timestamp}_$token"
+                    } else {
+                        "backup_${versionLabel}_${timestamp}_${token}_$attempt"
+                    }
+                    uniqueBackupDir = File(backupsRoot, dirName)
+                    attempt++
+                } while (uniqueBackupDir.exists() && attempt < 10)
+
+                if (uniqueBackupDir.exists()) {
+                    throw java.io.IOException("Refusing to overwrite existing backup directory: ${uniqueBackupDir.absolutePath}")
+                }
+                if (!uniqueBackupDir.mkdirs() || !uniqueBackupDir.isDirectory) {
+                    throw java.io.IOException("Failed to create unique backup directory at ${uniqueBackupDir.absolutePath}")
+                }
+
+                // 3. Preserve the main database file and any WAL/SHM/journal files required for recovery
+                val walFile = File(dbFile.path + "-wal")
+                val shmFile = File(dbFile.path + "-shm")
+                val journalFile = File(dbFile.path + "-journal")
+
+                val filesToPreserve = buildList {
+                    add(dbFile)
+                    // Include WAL/SHM/journal if they exist and contain data, or if WAL checkpoint was busy/incomplete
+                    if (walFile.exists() && (walFile.length() > 0L || walCheckpointBusy)) {
+                        add(walFile)
+                    }
+                    if (shmFile.exists() && (shmFile.length() > 0L || walFile.length() > 0L || walCheckpointBusy)) {
+                        add(shmFile)
+                    }
+                    if (journalFile.exists() && journalFile.length() > 0L) {
+                        add(journalFile)
+                    }
+                }
+
+                for (src in filesToPreserve) {
+                    if (!src.exists() || !src.isFile) {
+                        throw java.io.IOException("Source database file missing or unreadable: ${src.absolutePath}")
+                    }
+                    val expectedLength = src.length()
+                    val dest = File(uniqueBackupDir, src.name)
+                    if (dest.exists()) {
+                        throw java.io.IOException("Refusing to overwrite existing backup file: ${dest.absolutePath}")
+                    }
+
+                    FileInputStream(src).use { input ->
+                        FileOutputStream(dest, false).use { output ->
+                            input.copyTo(output)
+                            output.flush()
+                            try {
+                                output.fd.sync()
+                            } catch (_: Exception) {
+                                // FileDescriptor.sync() may not be supported on all virtual filesystems
+                            }
+                        }
+                    }
+
+                    if (!dest.exists() || dest.length() != expectedLength) {
+                        throw java.io.IOException(
+                            "Backup file verification failed for ${src.name}: expected $expectedLength bytes, found ${dest.length()} bytes"
+                        )
+                    }
+                }
+
+                val primaryBackupFile = File(uniqueBackupDir, dbFile.name)
+                if (!primaryBackupFile.exists() || primaryBackupFile.length() <= 0L) {
+                    throw java.io.IOException("Primary database backup file is missing or empty in ${uniqueBackupDir.absolutePath}")
+                }
+
+                Log.i(
+                    TAG,
+                    "Consistent pre-migration database backup created at ${uniqueBackupDir.absolutePath} (${filesToPreserve.size} file(s) preserved)"
+                )
+                Result.success(uniqueBackupDir)
             } catch (e: Exception) {
-                Log.e(TAG, "Pre-migration backup notice: ${e.message}", e)
+                Log.e(TAG, "Pre-migration database backup FAILED: ${e.message}", e)
+                Result.failure(e)
             }
         }
     }
