@@ -14,6 +14,10 @@ import com.example.api.GrammarSuggestion
 import com.example.api.GeminiStoryTracker
 import com.example.api.ExtractedStoryData
 import com.example.data.*
+import com.example.drive.DriveAuthorizationOutcome
+import com.example.drive.DriveBackupError
+import com.example.drive.DriveConnectionUiState
+import com.example.drive.GoogleDriveBackupRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -37,6 +41,13 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
     private val repository: NovelRepository
     private val grammarChecker = GeminiGrammarChecker()
     private val storyTracker = GeminiStoryTracker()
+    val driveBackupRepository = GoogleDriveBackupRepository(application)
+
+    private val _driveUiState = MutableStateFlow(DriveConnectionUiState())
+    val driveUiState: StateFlow<DriveConnectionUiState> = _driveUiState.asStateFlow()
+
+    private val _pendingDriveResolution = MutableStateFlow<android.app.PendingIntent?>(null)
+    val pendingDriveResolution: StateFlow<android.app.PendingIntent?> = _pendingDriveResolution.asStateFlow()
 
     // --- State flows ---
     val allNodes: StateFlow<List<ManuscriptNode>>
@@ -220,6 +231,21 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     if (novelId != null && novelId != _selectedNovelId.value) {
                         _selectedNovelId.value = novelId
                     }
+                }
+            }
+        }
+
+        // Observe persisted Google Drive backup metadata
+        viewModelScope.launch {
+            driveBackupRepository.metadataFlow.collect { meta ->
+                _driveUiState.update { current ->
+                    current.copy(
+                        isConnected = meta.isConnected,
+                        connectedAccountLabel = meta.connectedAccountEmail,
+                        lastBackupFileId = meta.lastBackupDriveFileId,
+                        lastBackupTimestampMillis = meta.lastBackupTimestampMillis,
+                        knownBackupCount = meta.knownBackupIds.size
+                    )
                 }
             }
         }
@@ -1265,5 +1291,235 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         currentlyAnalyzingNodeId = null
         currentlyAnalyzingHash = null
         _lastSavedTimeText.value = "Story database updated"
+    }
+
+    // --- Google Drive Backup & Restore Foundation ---
+    fun connectGoogleDrive() {
+        viewModelScope.launch {
+            _driveUiState.update {
+                it.copy(isAuthorizing = true, error = null, statusMessage = "Requesting Google Drive authorization...")
+            }
+            val result = driveBackupRepository.connectAndAuthorize()
+            result.fold(
+                onSuccess = { outcome ->
+                    when (outcome) {
+                        is DriveAuthorizationOutcome.Authorized -> {
+                            _driveUiState.update {
+                                it.copy(
+                                    isConnected = true,
+                                    isAuthorizing = false,
+                                    statusMessage = "Google Drive connected (drive.file scope).",
+                                    error = null
+                                )
+                            }
+                        }
+                        is DriveAuthorizationOutcome.ResolutionRequired -> {
+                            _pendingDriveResolution.value = outcome.pendingIntent
+                            _driveUiState.update {
+                                it.copy(
+                                    isAuthorizing = true,
+                                    statusMessage = "Waiting for user consent..."
+                                )
+                            }
+                        }
+                    }
+                },
+                onFailure = { err ->
+                    val driveError = driveBackupRepository.mapToDriveBackupError(err)
+                    _driveUiState.update {
+                        it.copy(
+                            isAuthorizing = false,
+                            statusMessage = null,
+                            error = driveError
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun onDriveResolutionResult(resultCode: Int, data: Intent?) {
+        _pendingDriveResolution.value = null
+        viewModelScope.launch {
+            val result = driveBackupRepository.handleAuthorizationIntentResult(resultCode, data)
+            result.fold(
+                onSuccess = {
+                    _driveUiState.update {
+                        it.copy(
+                            isConnected = true,
+                            isAuthorizing = false,
+                            statusMessage = "Google Drive authorized and ready for manual backups.",
+                            error = null
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    val driveError = driveBackupRepository.mapToDriveBackupError(err)
+                    _driveUiState.update {
+                        it.copy(
+                            isConnected = false,
+                            isAuthorizing = false,
+                            statusMessage = null,
+                            error = driveError
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun clearPendingDriveResolution() {
+        _pendingDriveResolution.value = null
+    }
+
+    fun disconnectGoogleDrive() {
+        viewModelScope.launch {
+            _driveUiState.update {
+                it.copy(isBusy = true, error = null, statusMessage = "Disconnecting Google Drive...")
+            }
+            val result = driveBackupRepository.disconnectAndRevoke()
+            result.fold(
+                onSuccess = {
+                    _driveUiState.update {
+                        it.copy(
+                            isConnected = false,
+                            isBusy = false,
+                            connectedAccountLabel = null,
+                            remoteBackups = emptyList(),
+                            statusMessage = "Disconnected from Google Drive.",
+                            error = null
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    val driveError = driveBackupRepository.mapToDriveBackupError(err)
+                    _driveUiState.update {
+                        it.copy(
+                            isConnected = false,
+                            isBusy = false,
+                            statusMessage = null,
+                            error = driveError
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun uploadManualDriveBackup() {
+        if (!_driveUiState.value.isConnected) return
+        viewModelScope.launch {
+            _driveUiState.update {
+                it.copy(isBusy = true, error = null, statusMessage = "Uploading backup to Google Drive...")
+            }
+            val app = getApplication<Application>()
+            val dbFile = app.getDatabasePath("novel_writer_database")
+            if (dbFile == null || !dbFile.exists() || dbFile.length() == 0L) {
+                _driveUiState.update {
+                    it.copy(
+                        isBusy = false,
+                        statusMessage = null,
+                        error = DriveBackupError.DriveApiFailure(message = "Local database file is not available to back up yet.")
+                    )
+                }
+                return@launch
+            }
+
+            val backupFileName = "novel_studio_backup_${System.currentTimeMillis()}.sqlite"
+            val result = driveBackupRepository.uploadBackupFile(
+                localFile = dbFile,
+                backupFileName = backupFileName
+            )
+            result.fold(
+                onSuccess = { uploaded ->
+                    _driveUiState.update {
+                        it.copy(
+                            isBusy = false,
+                            statusMessage = "Uploaded backup '${uploaded.name}' to Google Drive.",
+                            error = null
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    val driveError = driveBackupRepository.mapToDriveBackupError(err)
+                    _driveUiState.update {
+                        it.copy(
+                            isBusy = false,
+                            statusMessage = null,
+                            error = driveError
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun refreshDriveBackups() {
+        if (!_driveUiState.value.isConnected) return
+        viewModelScope.launch {
+            _driveUiState.update {
+                it.copy(isBusy = true, error = null, statusMessage = "Listing Google Drive backups...")
+            }
+            val result = driveBackupRepository.listBackupFiles()
+            result.fold(
+                onSuccess = { files ->
+                    _driveUiState.update {
+                        it.copy(
+                            isBusy = false,
+                            remoteBackups = files,
+                            statusMessage = "Found ${files.size} backup(s) in Google Drive.",
+                            error = null
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    val driveError = driveBackupRepository.mapToDriveBackupError(err)
+                    _driveUiState.update {
+                        it.copy(
+                            isBusy = false,
+                            statusMessage = null,
+                            error = driveError
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun downloadDriveBackupToStaging(driveFileId: String, fileName: String) {
+        if (!_driveUiState.value.isConnected) return
+        viewModelScope.launch {
+            _driveUiState.update {
+                it.copy(isBusy = true, error = null, statusMessage = "Downloading '$fileName' from Google Drive...")
+            }
+            val stagingDir = File(getApplication<Application>().filesDir, "drive_downloaded_backups")
+            val destFile = File(stagingDir, fileName)
+            val result = driveBackupRepository.downloadBackupFile(driveFileId, destFile)
+            result.fold(
+                onSuccess = { downloaded ->
+                    _driveUiState.update {
+                        it.copy(
+                            isBusy = false,
+                            statusMessage = "Downloaded '${downloaded.name}' to local staging (${downloaded.length()} bytes). Live DB restore is not enabled yet.",
+                            error = null
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    val driveError = driveBackupRepository.mapToDriveBackupError(err)
+                    _driveUiState.update {
+                        it.copy(
+                            isBusy = false,
+                            statusMessage = null,
+                            error = driveError
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun clearDriveError() {
+        _driveUiState.update { it.copy(error = null) }
     }
 }

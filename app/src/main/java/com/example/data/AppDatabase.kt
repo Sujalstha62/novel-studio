@@ -105,11 +105,9 @@ abstract class AppDatabase : RoomDatabase() {
                 lastBackupResult = backupResult
                 if (backupResult.isFailure) {
                     val err = backupResult.exceptionOrNull()
-                    Log.e(
-                        TAG,
-                        "CRITICAL: Pre-migration local database backup failed: ${err?.message}",
-                        err
-                    )
+                    val message = "Aborted database initialization and migration because pre-migration local database backup failed: ${err?.message ?: "Unknown backup error"}"
+                    Log.e(TAG, "CRITICAL: $message", err)
+                    throw IllegalStateException(message, err)
                 }
 
                 val instance = Room.databaseBuilder(

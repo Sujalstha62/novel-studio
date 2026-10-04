@@ -1,6 +1,9 @@
 package com.example.ui
 
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
@@ -2631,6 +2634,25 @@ fun SettingsScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
     val settings by viewModel.settings.collectAsState()
     val selectedFont by viewModel.selectedFont.collectAsState()
     val lastSavedTimeText by viewModel.lastSavedTimeText.collectAsState()
+    val driveUiState by viewModel.driveUiState.collectAsState()
+    val pendingDriveResolution by viewModel.pendingDriveResolution.collectAsState()
+
+    val driveAuthLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { activityResult ->
+        viewModel.onDriveResolutionResult(activityResult.resultCode, activityResult.data)
+    }
+
+    LaunchedEffect(pendingDriveResolution) {
+        val pendingIntent = pendingDriveResolution ?: return@LaunchedEffect
+        try {
+            val request = IntentSenderRequest.Builder(pendingIntent.intentSender).build()
+            driveAuthLauncher.launch(request)
+        } catch (e: Exception) {
+            viewModel.clearPendingDriveResolution()
+            viewModel.onDriveResolutionResult(android.app.Activity.RESULT_CANCELED, null)
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -2711,9 +2733,178 @@ fun SettingsScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Icon(Icons.Outlined.CloudOff, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), modifier = Modifier.size(18.dp))
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Cloud Sync: Not Configured", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f), fontWeight = FontWeight.SemiBold)
+                                    Text("Live Cloud Sync: Not Enabled (Local-First)", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f), fontWeight = FontWeight.SemiBold)
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // Backup & Restore (Google Drive) Card
+            item {
+                Card(
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .shadow(2.dp, RoundedCornerShape(16.dp))
+                        .testTag("drive_backup_restore_card")
+                ) {
+                    Column(modifier = Modifier.padding(18.dp)) {
+                        Text(
+                            text = "Backup & Restore",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Manual Google Drive backup using narrow per-file authorization (drive.file scope).",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                        )
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(14.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = if (driveUiState.isConnected) Icons.Default.CloudDone else Icons.Outlined.CloudQueue,
+                                        contentDescription = "Google Drive Connection Status",
+                                        tint = if (driveUiState.isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = if (driveUiState.isConnected) {
+                                            "Google Drive Status: Connected (${driveUiState.connectedAccountLabel ?: "Authorized"})"
+                                        } else if (driveUiState.isAuthorizing) {
+                                            "Google Drive Status: Authorizing..."
+                                        } else {
+                                            "Google Drive Status: Not Connected"
+                                        },
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
+                                        modifier = Modifier.testTag("drive_connection_status_text")
+                                    )
+                                }
+
+                                if (driveUiState.lastBackupFileId != null) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "Last Drive Backup ID: ${driveUiState.lastBackupFileId} (${driveUiState.knownBackupCount} tracked)",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                                    )
+                                }
+
+                                if (!driveUiState.statusMessage.isNullOrBlank()) {
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Text(
+                                        text = driveUiState.statusMessage ?: "",
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+
+                                val driveError = driveUiState.error
+                                if (driveError != null) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.errorContainer,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(10.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.ErrorOutline,
+                                                contentDescription = "Drive Error",
+                                                tint = MaterialTheme.colorScheme.onErrorContainer,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(
+                                                text = driveError.message,
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            if (!driveUiState.isConnected) {
+                                Button(
+                                    onClick = { viewModel.connectGoogleDrive() },
+                                    enabled = !driveUiState.isAuthorizing && !driveUiState.isBusy,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                        .testTag("connect_google_drive_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.AddToDrive,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(if (driveUiState.isAuthorizing) "Authorizing..." else "Connect Google Drive")
+                                }
+                            } else {
+                                OutlinedButton(
+                                    onClick = { viewModel.disconnectGoogleDrive() },
+                                    enabled = !driveUiState.isBusy,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                        .testTag("disconnect_google_drive_button")
+                                ) {
+                                    Text("Disconnect Drive")
+                                }
+                            }
+
+                            Button(
+                                onClick = { viewModel.uploadManualDriveBackup() },
+                                enabled = driveUiState.isConnected && !driveUiState.isBusy && !driveUiState.isAuthorizing,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .testTag("drive_backup_now_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Backup,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(if (driveUiState.isConnected) "Back Up Now" else "Backup Unavailable")
+                            }
+                        }
+
+                        if (!driveUiState.isConnected) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Backup action is disabled until Google Drive authorization is connected.",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f)
+                            )
                         }
                     }
                 }
