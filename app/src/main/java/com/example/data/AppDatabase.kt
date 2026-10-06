@@ -100,18 +100,27 @@ abstract class AppDatabase : RoomDatabase() {
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
-                // Perform safety backup with WAL checkpoint before opening/migrating database
-                val backupResult = backupDatabaseSafely(context)
-                lastBackupResult = backupResult
-                if (backupResult.isFailure) {
-                    val err = backupResult.exceptionOrNull()
-                    val message = "Aborted database initialization and migration because pre-migration local database backup failed: ${err?.message ?: "Unknown backup error"}"
-                    Log.e(TAG, "CRITICAL: $message", err)
-                    throw IllegalStateException(message, err)
+                val appContext = context.applicationContext
+                if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                    // Never block the UI thread (prevents FrameTracker / IME_INSETS_SHOW_ANIMATION timeouts)
+                    Thread {
+                        val backupResult = backupDatabaseSafely(appContext)
+                        lastBackupResult = backupResult
+                    }.start()
+                } else {
+                    // Perform safety backup with WAL checkpoint before opening/migrating database
+                    val backupResult = backupDatabaseSafely(appContext)
+                    lastBackupResult = backupResult
+                    if (backupResult.isFailure) {
+                        val err = backupResult.exceptionOrNull()
+                        val message = "Aborted database initialization and migration because pre-migration local database backup failed: ${err?.message ?: "Unknown backup error"}"
+                        Log.e(TAG, "CRITICAL: $message", err)
+                        throw IllegalStateException(message, err)
+                    }
                 }
 
                 val instance = Room.databaseBuilder(
-                    context.applicationContext,
+                    appContext,
                     AppDatabase::class.java,
                     DATABASE_NAME
                 )
@@ -120,6 +129,92 @@ abstract class AppDatabase : RoomDatabase() {
                 .build()
                 INSTANCE = instance
                 instance
+            }
+        }
+
+        /**
+         * Safely checkpoints and closes the active Room database instance and invalidates the singleton
+         * reference so the underlying SQLite files can be replaced cleanly during a verified restore.
+         */
+        fun closeAndInvalidateDatabase() {
+            synchronized(this) {
+                val current = INSTANCE
+                INSTANCE = null
+                if (current != null) {
+                    try {
+                        if (current.isOpen) {
+                            current.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(TRUNCATE)").close()
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "WAL checkpoint before closing Room database completed with notice: ${e.message}")
+                    }
+                    try {
+                        current.close()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Closing Room database completed with notice: ${e.message}")
+                    }
+                }
+            }
+        }
+
+        /**
+         * Reopens Room after a database restore (or rollback) and verifies that the database opens,
+         * passes SQLite integrity_check, and can be queried across Novel Studio tables.
+         */
+        fun reopenAndVerifyDatabase(context: Context): AppDatabase {
+            return synchronized(this) {
+                INSTANCE?.let { existing ->
+                    try {
+                        existing.close()
+                    } catch (_: Exception) {
+                    }
+                    INSTANCE = null
+                }
+
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    AppDatabase::class.java,
+                    DATABASE_NAME
+                )
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .build()
+
+                try {
+                    val supportDb = instance.openHelper.writableDatabase
+                    supportDb.query("PRAGMA integrity_check").use { cursor ->
+                        val status = if (cursor.moveToFirst()) cursor.getString(0) else null
+                        if (!status.equals("ok", ignoreCase = true)) {
+                            throw IllegalStateException("Reopened database failed PRAGMA integrity_check: ${status ?: "no result"}")
+                        }
+                    }
+
+                    // Verify core Novel Studio tables can be queried through SQLite/Room
+                    val requiredTables = listOf(
+                        "manuscript_nodes",
+                        "character_profiles",
+                        "writing_settings",
+                        "story_events",
+                        "character_relationships",
+                        "manuscript_commits"
+                    )
+                    for (table in requiredTables) {
+                        supportDb.query("SELECT COUNT(*) FROM `$table`").use { cursor ->
+                            if (!cursor.moveToFirst()) {
+                                throw IllegalStateException("Verification query failed on table '$table'")
+                            }
+                        }
+                    }
+
+                    INSTANCE = instance
+                    instance
+                } catch (e: Exception) {
+                    try {
+                        instance.close()
+                    } catch (_: Exception) {
+                    }
+                    INSTANCE = null
+                    throw e
+                }
             }
         }
 

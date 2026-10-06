@@ -1,36 +1,74 @@
 package com.example.data
 
 import androidx.room.withTransaction
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.flatMapLatest
 import java.util.ArrayDeque
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class NovelRepository(
-    private val database: AppDatabase,
-    private val manuscriptDao: ManuscriptDao,
-    private val characterDao: CharacterDao,
-    private val settingsDao: SettingsDao,
-    private val storyEventDao: StoryEventDao,
-    private val characterRelationshipDao: CharacterRelationshipDao,
-    private val manuscriptCommitDao: ManuscriptCommitDao
+    initialDatabase: AppDatabase,
+    initialManuscriptDao: ManuscriptDao = initialDatabase.manuscriptDao(),
+    initialCharacterDao: CharacterDao = initialDatabase.characterDao(),
+    initialSettingsDao: SettingsDao = initialDatabase.settingsDao(),
+    initialStoryEventDao: StoryEventDao = initialDatabase.storyEventDao(),
+    initialCharacterRelationshipDao: CharacterRelationshipDao = initialDatabase.characterRelationshipDao(),
+    initialManuscriptCommitDao: ManuscriptCommitDao = initialDatabase.manuscriptCommitDao()
 ) {
-    val allNodes: Flow<List<ManuscriptNode>> = manuscriptDao.getAllNodesFlow()
-    val allCharacters: Flow<List<CharacterProfile>> = characterDao.getAllCharactersFlow()
-    val settings: Flow<WritingSettings?> = settingsDao.getSettingsFlow()
-    val allEvents: Flow<List<StoryEvent>> = storyEventDao.getAllEventsFlow()
-    val allRelationships: Flow<List<CharacterRelationship>> = characterRelationshipDao.getAllRelationshipsFlow()
-    val allCommits: Flow<List<ManuscriptCommit>> = manuscriptCommitDao.getAllCommitsFlow()
+    private val activeDatabaseFlow = MutableStateFlow(initialDatabase)
+
+    private val database: AppDatabase
+        get() = activeDatabaseFlow.value
+    private val manuscriptDao: ManuscriptDao
+        get() = activeDatabaseFlow.value.manuscriptDao()
+    private val characterDao: CharacterDao
+        get() = activeDatabaseFlow.value.characterDao()
+    private val settingsDao: SettingsDao
+        get() = activeDatabaseFlow.value.settingsDao()
+    private val storyEventDao: StoryEventDao
+        get() = activeDatabaseFlow.value.storyEventDao()
+    private val characterRelationshipDao: CharacterRelationshipDao
+        get() = activeDatabaseFlow.value.characterRelationshipDao()
+    private val manuscriptCommitDao: ManuscriptCommitDao
+        get() = activeDatabaseFlow.value.manuscriptCommitDao()
+
+    fun rebindDatabase(newDatabase: AppDatabase) {
+        activeDatabaseFlow.value = newDatabase
+    }
+
+    val allNodes: Flow<List<ManuscriptNode>> = activeDatabaseFlow.flatMapLatest { db ->
+        db.manuscriptDao().getAllNodesFlow()
+    }
+    val allCharacters: Flow<List<CharacterProfile>> = activeDatabaseFlow.flatMapLatest { db ->
+        db.characterDao().getAllCharactersFlow()
+    }
+    val settings: Flow<WritingSettings?> = activeDatabaseFlow.flatMapLatest { db ->
+        db.settingsDao().getSettingsFlow()
+    }
+    val allEvents: Flow<List<StoryEvent>> = activeDatabaseFlow.flatMapLatest { db ->
+        db.storyEventDao().getAllEventsFlow()
+    }
+    val allRelationships: Flow<List<CharacterRelationship>> = activeDatabaseFlow.flatMapLatest { db ->
+        db.characterRelationshipDao().getAllRelationshipsFlow()
+    }
+    val allCommits: Flow<List<ManuscriptCommit>> = activeDatabaseFlow.flatMapLatest { db ->
+        db.manuscriptCommitDao().getAllCommitsFlow()
+    }
 
     fun getCharactersByNovelFlow(novelId: Int): Flow<List<CharacterProfile>> =
-        characterDao.getCharactersByNovelFlow(novelId)
+        activeDatabaseFlow.flatMapLatest { db -> db.characterDao().getCharactersByNovelFlow(novelId) }
 
     fun getEventsByNovelFlow(novelId: Int): Flow<List<StoryEvent>> =
-        storyEventDao.getEventsByNovelFlow(novelId)
+        activeDatabaseFlow.flatMapLatest { db -> db.storyEventDao().getEventsByNovelFlow(novelId) }
 
     fun getRelationshipsByNovelFlow(novelId: Int): Flow<List<CharacterRelationship>> =
-        characterRelationshipDao.getRelationshipsByNovelFlow(novelId)
+        activeDatabaseFlow.flatMapLatest { db -> db.characterRelationshipDao().getRelationshipsByNovelFlow(novelId) }
 
-    fun getNodeByIdFlow(id: Int): Flow<ManuscriptNode?> = manuscriptDao.getNodeByIdFlow(id)
+    fun getNodeByIdFlow(id: Int): Flow<ManuscriptNode?> =
+        activeDatabaseFlow.flatMapLatest { db -> db.manuscriptDao().getNodeByIdFlow(id) }
     suspend fun getNodeById(id: Int): ManuscriptNode? = manuscriptDao.getNodeById(id)
 
     suspend fun insertNode(node: ManuscriptNode): Long = manuscriptDao.insertNode(node)
@@ -91,7 +129,8 @@ class NovelRepository(
     suspend fun insertOrUpdateSettings(settings: WritingSettings) = settingsDao.insertOrUpdateSettings(settings)
 
     // Commit history methods
-    fun getCommitsForNodeFlow(nodeId: Int): Flow<List<ManuscriptCommit>> = manuscriptCommitDao.getCommitsForNodeFlow(nodeId)
+    fun getCommitsForNodeFlow(nodeId: Int): Flow<List<ManuscriptCommit>> =
+        activeDatabaseFlow.flatMapLatest { db -> db.manuscriptCommitDao().getCommitsForNodeFlow(nodeId) }
     suspend fun insertCommit(commit: ManuscriptCommit) = manuscriptCommitDao.insertCommit(commit)
     suspend fun deleteCommitById(commitId: Int) = manuscriptCommitDao.deleteCommitById(commitId)
 

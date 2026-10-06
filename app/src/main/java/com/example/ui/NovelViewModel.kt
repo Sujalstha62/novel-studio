@@ -324,8 +324,17 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun countWords(text: String): Int {
-        if (text.isBlank()) return 0
-        return text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }.size
+        var count = 0
+        var inWord = false
+        for (i in 0 until text.length) {
+            if (text[i].isWhitespace()) {
+                inWord = false
+            } else if (!inWord) {
+                inWord = true
+                count++
+            }
+        }
+        return count
     }
 
     /**
@@ -1312,6 +1321,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                                     error = null
                                 )
                             }
+                            refreshDriveBackups()
                         }
                         is DriveAuthorizationOutcome.ResolutionRequired -> {
                             _pendingDriveResolution.value = outcome.pendingIntent
@@ -1340,6 +1350,10 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onDriveResolutionResult(resultCode: Int, data: Intent?) {
         _pendingDriveResolution.value = null
+        Log.i(
+            TAG,
+            "onDriveResolutionResult: resultCode=$resultCode, hasResultIntent=${data != null}"
+        )
         viewModelScope.launch {
             val result = driveBackupRepository.handleAuthorizationIntentResult(resultCode, data)
             result.fold(
@@ -1352,6 +1366,7 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                             error = null
                         )
                     }
+                    refreshDriveBackups()
                 },
                 onFailure = { err ->
                     val driveError = driveBackupRepository.mapToDriveBackupError(err)
@@ -1364,6 +1379,19 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 }
+            )
+        }
+    }
+
+    fun onDriveResolutionLaunchFailed(exception: Throwable) {
+        _pendingDriveResolution.value = null
+        val driveError = driveBackupRepository.handleAuthorizationLaunchFailure(exception)
+        _driveUiState.update {
+            it.copy(
+                isConnected = false,
+                isAuthorizing = false,
+                statusMessage = null,
+                error = driveError
             )
         }
     }
@@ -1410,24 +1438,25 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         if (!_driveUiState.value.isConnected) return
         viewModelScope.launch {
             _driveUiState.update {
-                it.copy(isBusy = true, error = null, statusMessage = "Uploading backup to Google Drive...")
+                it.copy(isBusy = true, error = null, statusMessage = "Creating consistent SQLite snapshot and uploading to Google Drive...")
             }
-            val app = getApplication<Application>()
-            val dbFile = app.getDatabasePath("novel_writer_database")
-            if (dbFile == null || !dbFile.exists() || dbFile.length() == 0L) {
-                _driveUiState.update {
-                    it.copy(
-                        isBusy = false,
-                        statusMessage = null,
-                        error = DriveBackupError.DriveApiFailure(message = "Local database file is not available to back up yet.")
-                    )
-                }
-                return@launch
+
+            // Flush any pending in-memory manuscript edits to Room before snapshotting
+            val currentActive = _activeNode.value
+            val currentText = _editorText.value
+            if (currentActive != null && !currentActive.isFolder && currentActive.content != currentText) {
+                val updatedNode = currentActive.copy(
+                    content = currentText,
+                    wordCount = countWords(currentText),
+                    lastUpdated = System.currentTimeMillis()
+                )
+                repository.updateNode(updatedNode)
+                _activeNode.value = updatedNode
+                _lastSavedTimeText.value = "Saved locally just now"
             }
 
             val backupFileName = "novel_studio_backup_${System.currentTimeMillis()}.sqlite"
-            val result = driveBackupRepository.uploadBackupFile(
-                localFile = dbFile,
+            val result = driveBackupRepository.backupDatabaseSnapshotToDrive(
                 backupFileName = backupFileName
             )
             result.fold(
@@ -1435,7 +1464,8 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     _driveUiState.update {
                         it.copy(
                             isBusy = false,
-                            statusMessage = "Uploaded backup '${uploaded.name}' to Google Drive.",
+                            remoteBackups = listOf(uploaded) + it.remoteBackups.filterNot { b -> b.id == uploaded.id },
+                            statusMessage = "Uploaded consistent snapshot '${uploaded.name}' to Google Drive.",
                             error = null
                         )
                     }
@@ -1486,30 +1516,75 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun downloadDriveBackupToStaging(driveFileId: String, fileName: String) {
-        if (!_driveUiState.value.isConnected) return
+    /**
+     * Restores a user-selected Google Drive backup safely into the local database:
+     * - Cancels active editor auto-save coroutines
+     * - Downloads to a unique local staging file
+     * - Validates SQLite integrity and Novel Studio Room schema compatibility
+     * - Creates a local pre-restore safety backup (aborting if it fails)
+     * - Closes Room, replaces the database cleanly without stale WAL/SHM/journal files,
+     *   reopens Room, and rebinds NovelRepository Flows (rolling back on any failure)
+     */
+    fun restoreSelectedDriveBackup(driveFileId: String, backupFileName: String) {
+        if (!_driveUiState.value.isConnected || _driveUiState.value.isBusy || _driveUiState.value.isRestoring) return
         viewModelScope.launch {
+            // Stop any active editor auto-save before closing/replacing the database
+            autoSaveJob?.cancel()
+            selectNode(null)
+
             _driveUiState.update {
-                it.copy(isBusy = true, error = null, statusMessage = "Downloading '$fileName' from Google Drive...")
+                it.copy(
+                    isBusy = true,
+                    isRestoring = true,
+                    restoringFileId = driveFileId,
+                    restoreProgressStep = "Preparing to restore '$backupFileName'...",
+                    statusMessage = "Preparing to restore '$backupFileName'...",
+                    error = null
+                )
             }
-            val stagingDir = File(getApplication<Application>().filesDir, "drive_downloaded_backups")
-            val destFile = File(stagingDir, fileName)
-            val result = driveBackupRepository.downloadBackupFile(driveFileId, destFile)
+
+            val result = driveBackupRepository.restoreBackupFromDrive(
+                driveFileId = driveFileId,
+                backupFileName = backupFileName,
+                onProgress = { stepMessage ->
+                    _driveUiState.update { state ->
+                        state.copy(
+                            restoreProgressStep = stepMessage,
+                            statusMessage = stepMessage
+                        )
+                    }
+                }
+            )
+
             result.fold(
-                onSuccess = { downloaded ->
+                onSuccess = { (reopenedDb, summary) ->
+                    repository.rebindDatabase(reopenedDb)
+                    _selectedNovelId.value = null
+                    _lastSavedTimeText.value = "Restored from '${summary.backupFileName}'"
                     _driveUiState.update {
                         it.copy(
                             isBusy = false,
-                            statusMessage = "Downloaded '${downloaded.name}' to local staging (${downloaded.length()} bytes). Live DB restore is not enabled yet.",
+                            isRestoring = false,
+                            restoringFileId = null,
+                            restoreProgressStep = null,
+                            lastRestoreSummary = summary,
+                            statusMessage = "Restored '${summary.backupFileName}' (${summary.restoredNodesCount} manuscript items, ${summary.restoredCharactersCount} characters, ${summary.restoredEventsCount} events).",
                             error = null
                         )
                     }
                 },
                 onFailure = { err ->
+                    // Ensure repository is rebound to the active (or rolled-back) Room instance
+                    runCatching {
+                        repository.rebindDatabase(AppDatabase.getDatabase(getApplication()))
+                    }
                     val driveError = driveBackupRepository.mapToDriveBackupError(err)
                     _driveUiState.update {
                         it.copy(
                             isBusy = false,
+                            isRestoring = false,
+                            restoringFileId = null,
+                            restoreProgressStep = null,
                             statusMessage = null,
                             error = driveError
                         )

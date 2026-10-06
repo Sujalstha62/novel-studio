@@ -77,7 +77,35 @@ sealed class DriveBackupError(
         message: String = "Google Drive API request failed.",
         cause: Throwable? = null
     ) : DriveBackupError(message, cause)
+
+    class InvalidBackupFile(
+        message: String = "Selected file is not a valid or compatible Novel Studio database backup.",
+        cause: Throwable? = null
+    ) : DriveBackupError(message, cause)
+
+    class PreRestoreBackupFailed(
+        message: String = "Aborted restore because creating the local pre-restore safety backup failed.",
+        cause: Throwable? = null
+    ) : DriveBackupError(message, cause)
+
+    class RestoreFailedWithRollback(
+        message: String = "Database restore failed; rolled back to pre-restore local backup.",
+        val rolledBackSuccessfully: Boolean = true,
+        cause: Throwable? = null
+    ) : DriveBackupError(message, cause)
 }
+
+/**
+ * Summary of a completed Google Drive backup restore operation.
+ */
+data class DriveRestoreSummary(
+    val backupFileId: String,
+    val backupFileName: String,
+    val restoredNodesCount: Int,
+    val restoredCharactersCount: Int,
+    val restoredEventsCount: Int,
+    val preRestoreBackupPath: String?
+)
 
 /**
  * UI state representing the Google Drive backup & restore connection in Settings.
@@ -86,11 +114,15 @@ data class DriveConnectionUiState(
     val isConnected: Boolean = false,
     val isAuthorizing: Boolean = false,
     val isBusy: Boolean = false,
+    val isRestoring: Boolean = false,
+    val restoringFileId: String? = null,
+    val restoreProgressStep: String? = null,
     val connectedAccountLabel: String? = null,
     val lastBackupFileId: String? = null,
     val lastBackupTimestampMillis: Long? = null,
     val knownBackupCount: Int = 0,
     val remoteBackups: List<DriveBackupFile> = emptyList(),
+    val lastRestoreSummary: DriveRestoreSummary? = null,
     val statusMessage: String? = null,
     val error: DriveBackupError? = null
 )

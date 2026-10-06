@@ -357,6 +357,7 @@ fun NovelApp(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(paddingValues)
+                    .imePadding()
             ) {
                 when (activeTab) {
                     is ActiveTab.Manuscript -> {
@@ -2650,7 +2651,7 @@ fun SettingsScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
             driveAuthLauncher.launch(request)
         } catch (e: Exception) {
             viewModel.clearPendingDriveResolution()
-            viewModel.onDriveResolutionResult(android.app.Activity.RESULT_CANCELED, null)
+            viewModel.onDriveResolutionLaunchFailed(e)
         }
     }
 
@@ -2901,10 +2902,234 @@ fun SettingsScreen(viewModel: NovelViewModel, onOpenDrawer: () -> Unit) {
                         if (!driveUiState.isConnected) {
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "Backup action is disabled until Google Drive authorization is connected.",
+                                text = "Backup and restore actions are disabled until Google Drive authorization is connected.",
                                 fontSize = 11.sp,
                                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f)
                             )
+                        } else {
+                            var pendingRestoreBackup by remember { mutableStateOf<com.example.drive.DriveBackupFile?>(null) }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Divider()
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Available Google Drive Backups",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = "Select a validated Novel Studio backup to restore.",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = { viewModel.refreshDriveBackups() },
+                                    enabled = !driveUiState.isBusy && !driveUiState.isRestoring,
+                                    modifier = Modifier
+                                        .heightIn(min = 48.dp)
+                                        .testTag("refresh_drive_backups_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = "Refresh Drive Backups",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Load Backups", fontSize = 12.sp)
+                                }
+                            }
+
+                            if (driveUiState.isRestoring && !driveUiState.restoreProgressStep.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("drive_restore_progress_banner")
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(18.dp),
+                                            strokeWidth = 2.dp
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Text(
+                                            text = driveUiState.restoreProgressStep ?: "Restoring backup...",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                                        )
+                                    }
+                                }
+                            }
+
+                            val restoreSummary = driveUiState.lastRestoreSummary
+                            if (restoreSummary != null && !driveUiState.isRestoring && driveUiState.error == null) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = MaterialTheme.colorScheme.secondaryContainer,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("drive_restore_success_banner")
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(
+                                                imageVector = Icons.Default.CheckCircle,
+                                                contentDescription = "Restore Succeeded",
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(
+                                                text = "Restored '${restoreSummary.backupFileName}'",
+                                                fontSize = 12.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "Verified ${restoreSummary.restoredNodesCount} manuscript items, ${restoreSummary.restoredCharactersCount} characters, and ${restoreSummary.restoredEventsCount} story events.",
+                                            fontSize = 11.sp,
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.85f)
+                                        )
+                                        if (!restoreSummary.preRestoreBackupPath.isNullOrBlank()) {
+                                            Text(
+                                                text = "Pre-restore local safety backup saved in: ${restoreSummary.preRestoreBackupPath}",
+                                                fontSize = 10.sp,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            if (driveUiState.remoteBackups.isEmpty()) {
+                                Text(
+                                    text = "No Novel Studio backups loaded yet. Tap 'Load Backups' or 'Back Up Now'.",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                                    modifier = Modifier.testTag("empty_drive_backups_text")
+                                )
+                            } else {
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    driveUiState.remoteBackups.forEach { backup ->
+                                        val dateText = remember(backup.createdTimeMillis) {
+                                            java.text.SimpleDateFormat("MMM d, yyyy h:mm a", java.util.Locale.getDefault())
+                                                .format(java.util.Date(backup.createdTimeMillis))
+                                        }
+                                        val sizeKb = (backup.sizeBytes / 1024L).coerceAtLeast(1L)
+                                        Surface(
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("drive_backup_item_${backup.id}")
+                                        ) {
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(12.dp),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = backup.name,
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        fontSize = 13.sp,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                    Spacer(modifier = Modifier.height(2.dp))
+                                                    Text(
+                                                        text = "$dateText • ${sizeKb} KB",
+                                                        fontSize = 11.sp,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                                                    )
+                                                }
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Button(
+                                                    onClick = { pendingRestoreBackup = backup },
+                                                    enabled = !driveUiState.isBusy && !driveUiState.isRestoring,
+                                                    modifier = Modifier
+                                                        .heightIn(min = 48.dp)
+                                                        .testTag("restore_drive_backup_${backup.id}")
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.Restore,
+                                                        contentDescription = null,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text(
+                                                        text = if (driveUiState.restoringFileId == backup.id) "Restoring..." else "Restore",
+                                                        fontSize = 12.sp
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            val backupToConfirm = pendingRestoreBackup
+                            if (backupToConfirm != null) {
+                                AlertDialog(
+                                    onDismissRequest = { pendingRestoreBackup = null },
+                                    title = {
+                                        Text("Restore Backup from Google Drive?", fontWeight = FontWeight.Bold)
+                                    },
+                                    text = {
+                                        Text(
+                                            "Restore '${backupToConfirm.name}' into Novel Studio?\n\n" +
+                                                "• The backup will be downloaded to a local staging file and validated first.\n" +
+                                                "• A local pre-restore safety backup of your current database will be created before any data is replaced.\n" +
+                                                "• If validation or the pre-restore safety backup fails, your current database will remain untouched."
+                                        )
+                                    },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = {
+                                                val chosen = backupToConfirm
+                                                pendingRestoreBackup = null
+                                                viewModel.restoreSelectedDriveBackup(chosen.id, chosen.name)
+                                            },
+                                            modifier = Modifier
+                                                .heightIn(min = 48.dp)
+                                                .testTag("confirm_drive_restore_button")
+                                        ) {
+                                            Text("Validate & Restore")
+                                        }
+                                    },
+                                    dismissButton = {
+                                        OutlinedButton(
+                                            onClick = { pendingRestoreBackup = null },
+                                            modifier = Modifier
+                                                .heightIn(min = 48.dp)
+                                                .testTag("cancel_drive_restore_button")
+                                        ) {
+                                            Text("Cancel")
+                                        }
+                                    }
+                                )
+                            }
                         }
                     }
                 }
