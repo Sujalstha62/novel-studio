@@ -1313,6 +1313,25 @@ class GoogleDriveBackupRepository(
     }
 
     /**
+     * Inspects [throwable] and its entire cause chain (including `ApiException.status.statusMessage`)
+     * for [needle] (case-insensitive).
+     */
+    private fun containsInThrowableChain(throwable: Throwable, needle: String): Boolean {
+        var current: Throwable? = throwable
+        val visited = mutableSetOf<Throwable>()
+        while (current != null && visited.add(current)) {
+            if (current.message?.contains(needle, ignoreCase = true) == true) return true
+            if (current.localizedMessage?.contains(needle, ignoreCase = true) == true) return true
+            if (current is ApiException) {
+                if (current.status.statusMessage?.contains(needle, ignoreCase = true) == true) return true
+                if (current.status.toString().contains(needle, ignoreCase = true)) return true
+            }
+            current = current.cause
+        }
+        return false
+    }
+
+    /**
      * Maps exceptions from Google Identity Services, OkHttp/NetHttpTransport, and Drive API v3
      * into explicit [DriveBackupError] categories with diagnostic details.
      */
@@ -1331,6 +1350,19 @@ class GoogleDriveBackupRepository(
                 append(hasResultIntent ?: "n/a")
                 append("]")
             }
+        }
+
+        if (containsInThrowableChain(throwable, "UNREGISTERED_ON_API_CONSOLE")) {
+            val statusDetail = if (throwable is ApiException) {
+                "status ${throwable.statusCode}: ${CommonStatusCodes.getStatusCodeString(throwable.statusCode)} — ${throwable.status.statusMessage ?: throwable.localizedMessage ?: "UNREGISTERED_ON_API_CONSOLE"}"
+            } else {
+                throwable.localizedMessage ?: throwable.message ?: "UNREGISTERED_ON_API_CONSOLE"
+            }
+            return DriveBackupError.MissingConfiguration(
+                "Google Cloud app registration is missing or mismatched (UNREGISTERED_ON_API_CONSOLE: $statusDetail)$diagnosticContext. " +
+                    "Verify in Google Cloud Console that an OAuth 2.0 Android Client ID is registered for exact application ID '${appContext.packageName}', " +
+                    "with this build's signing certificate SHA-1 fingerprint, and that the Google Drive API is enabled."
+            )
         }
 
         return when (throwable) {
@@ -1354,12 +1386,13 @@ class GoogleDriveBackupRepository(
                         cause = throwable
                     )
                     else -> {
-                        val msg = throwable.message ?: ""
+                        val msg = "${throwable.message.orEmpty()} ${throwable.status.statusMessage.orEmpty()}"
                         if (msg.contains("10:") || msg.contains("DEVELOPER_ERROR", ignoreCase = true) ||
-                            msg.contains("client_id", ignoreCase = true)
+                            msg.contains("client_id", ignoreCase = true) ||
+                            containsInThrowableChain(throwable, "DEVELOPER_ERROR")
                         ) {
                             DriveBackupError.MissingConfiguration(
-                                "Google Cloud OAuth configuration error (status ${throwable.statusCode}: $statusName — ${throwable.localizedMessage ?: msg})$diagnosticContext. Verify package '${appContext.packageName}', SHA-1 fingerprint, OAuth test user access, and Drive API enablement."
+                                "Google Cloud OAuth configuration error (status ${throwable.statusCode}: $statusName — ${throwable.localizedMessage ?: msg.trim()})$diagnosticContext. Verify OAuth Android Client ID, exact application ID '${appContext.packageName}', signing certificate SHA-1, and Google Drive API enablement."
                             )
                         } else {
                             DriveBackupError.DriveApiFailure(
