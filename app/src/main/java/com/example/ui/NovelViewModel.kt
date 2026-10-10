@@ -454,12 +454,39 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         _grammarErrorMessage.value = null
 
         viewModelScope.launch {
+            val requestId = com.example.api.RetrofitClient.nextRequestId()
+            val opStartTimestampMs = System.currentTimeMillis()
+            Log.i(
+                "AI_TIMING",
+                "AI_TIMING operation=GRAMMAR request=$requestId event=OPERATION_START " +
+                    "startTimestampMs=$opStartTimestampMs inputChars=${currentText.length}"
+            )
+            var operationCompleted = false
+            var geminiSuccess = false
+            var usedLocalFallback = false
             try {
-                val suggestions = grammarChecker.checkGrammar(currentText)
-                _grammarSuggestions.value = suggestions
+                val outcome = grammarChecker.checkGrammarWithDiagnostics(currentText, requestId = requestId)
+                _grammarSuggestions.value = outcome.suggestions
+                operationCompleted = true
+                geminiSuccess = outcome.geminiSuccess
+                usedLocalFallback = outcome.usedLocalFallback
+                Log.i(
+                    TAG,
+                    "Grammar pipeline counts: ViewModel suggestions count=${_grammarSuggestions.value.size}"
+                )
             } catch (e: Exception) {
                 Log.e(TAG, "Grammar check failed: ${e.message}")
             } finally {
+                val opEndTimestampMs = System.currentTimeMillis()
+                val totalElapsedMs = opEndTimestampMs - opStartTimestampMs
+                Log.i(
+                    "AI_TIMING",
+                    "AI_TIMING operation=GRAMMAR request=$requestId event=OPERATION_END " +
+                        "startTimestampMs=$opStartTimestampMs endTimestampMs=$opEndTimestampMs " +
+                        "totalElapsedMs=$totalElapsedMs operationCompleted=$operationCompleted " +
+                        "geminiSuccess=$geminiSuccess usedLocalFallback=$usedLocalFallback " +
+                        "suggestionsCount=${_grammarSuggestions.value.size} inputChars=${currentText.length}"
+                )
                 _isCheckingGrammar.value = false
             }
         }
@@ -938,9 +965,28 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
         currentlyAnalyzingHash = contentHash
 
         viewModelScope.launch {
+            val requestId = com.example.api.RetrofitClient.nextRequestId()
+            val opStartTimestampMs = System.currentTimeMillis()
+            val triggerType = if (isManual) "MANUAL" else "AUTO_THROTTLED"
+            Log.i(
+                "AI_TIMING",
+                "AI_TIMING operation=STORY_ANALYSIS request=$requestId event=OPERATION_START trigger=$triggerType " +
+                    "startTimestampMs=$opStartTimestampMs nodeId=$nodeId inputChars=${node.content.length}"
+            )
+            var operationCompleted = false
+            var geminiSuccess = false
+            var usedLocalFallback = false
+            var proposedCount = 0
             try {
                 val novelId = findNovelFolderIdForNode(nodeId) ?: _selectedNovelId.value ?: 1
-                val extracted = storyTracker.trackStory(node.content, node.name)
+                val outcome = storyTracker.trackStoryWithDiagnostics(
+                    text = node.content,
+                    chapterTitle = node.name,
+                    requestId = requestId
+                )
+                val extracted = outcome.data
+                geminiSuccess = outcome.geminiSuccess
+                usedLocalFallback = outcome.usedLocalFallback
 
                 // Build proposed changes by comparing against existing database data for this novel
                 val changes = mutableListOf<ProposedChange>()
@@ -1147,6 +1193,8 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
+                proposedCount = changes.size
+                operationCompleted = true
                 if (changes.isNotEmpty()) {
                     _proposedChanges.value = changes
                     _showReviewDialog.value = true
@@ -1160,6 +1208,16 @@ class NovelViewModel(application: Application) : AndroidViewModel(application) {
                 Log.e(TAG, "Story analysis failed: ${e.message}", e)
                 _analysisStatusMessage.value = "Analysis error: ${e.localizedMessage ?: "Unknown error"}"
             } finally {
+                val opEndTimestampMs = System.currentTimeMillis()
+                val totalElapsedMs = opEndTimestampMs - opStartTimestampMs
+                Log.i(
+                    "AI_TIMING",
+                    "AI_TIMING operation=STORY_ANALYSIS request=$requestId event=OPERATION_END trigger=$triggerType " +
+                        "startTimestampMs=$opStartTimestampMs endTimestampMs=$opEndTimestampMs " +
+                        "totalElapsedMs=$totalElapsedMs operationCompleted=$operationCompleted " +
+                        "geminiSuccess=$geminiSuccess usedLocalFallback=$usedLocalFallback " +
+                        "proposedChangesCount=$proposedCount nodeId=$nodeId inputChars=${node.content.length}"
+                )
                 _isAnalyzingStory.value = false
             }
         }

@@ -100,35 +100,33 @@ abstract class AppDatabase : RoomDatabase() {
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
-                val appContext = context.applicationContext
-                if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
-                    // Never block the UI thread (prevents FrameTracker / IME_INSETS_SHOW_ANIMATION timeouts)
-                    Thread {
+                INSTANCE ?: run {
+                    val appContext = context.applicationContext
+                    if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+                        // Perform safety backup with WAL checkpoint before opening/migrating database when called off the UI thread
                         val backupResult = backupDatabaseSafely(appContext)
                         lastBackupResult = backupResult
-                    }.start()
-                } else {
-                    // Perform safety backup with WAL checkpoint before opening/migrating database
-                    val backupResult = backupDatabaseSafely(appContext)
-                    lastBackupResult = backupResult
-                    if (backupResult.isFailure) {
-                        val err = backupResult.exceptionOrNull()
-                        val message = "Aborted database initialization and migration because pre-migration local database backup failed: ${err?.message ?: "Unknown backup error"}"
-                        Log.e(TAG, "CRITICAL: $message", err)
-                        throw IllegalStateException(message, err)
+                        if (backupResult.isFailure) {
+                            val err = backupResult.exceptionOrNull()
+                            Log.e(
+                                TAG,
+                                "Pre-open local database backup reported an issue: ${err?.message ?: "Unknown backup error"}",
+                                err
+                            )
+                        }
                     }
-                }
 
-                val instance = Room.databaseBuilder(
-                    appContext,
-                    AppDatabase::class.java,
-                    DATABASE_NAME
-                )
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
-                // NEVER use destructive migration for user manuscript data!
-                .build()
-                INSTANCE = instance
-                instance
+                    val instance = Room.databaseBuilder(
+                        appContext,
+                        AppDatabase::class.java,
+                        DATABASE_NAME
+                    )
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    // NEVER use destructive migration for user manuscript data!
+                    .build()
+                    INSTANCE = instance
+                    instance
+                }
             }
         }
 

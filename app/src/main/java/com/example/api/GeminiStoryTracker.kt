@@ -42,14 +42,36 @@ data class ExtractedStoryData(
     val relationships: List<ExtractedRelationship> = emptyList()
 )
 
+data class StoryTrackOutcome(
+    val data: ExtractedStoryData,
+    val requestId: Int,
+    val geminiSuccess: Boolean,
+    val usedLocalFallback: Boolean
+)
+
 class GeminiStoryTracker {
     private val TAG = "GeminiStoryTracker"
 
-    suspend fun trackStory(text: String, chapterTitle: String): ExtractedStoryData = withContext(Dispatchers.IO) {
+    suspend fun trackStory(
+        text: String,
+        chapterTitle: String,
+        requestId: Int = RetrofitClient.nextRequestId()
+    ): ExtractedStoryData = trackStoryWithDiagnostics(text, chapterTitle, requestId).data
+
+    suspend fun trackStoryWithDiagnostics(
+        text: String,
+        chapterTitle: String,
+        requestId: Int = RetrofitClient.nextRequestId()
+    ): StoryTrackOutcome = withContext(Dispatchers.IO) {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
-            Log.e(TAG, "API Key is missing or default placeholder. Using local smart fallback.")
-            return@withContext getLocalBackupStoryData(text, chapterTitle)
+            Log.w(TAG, "API Key is missing or default placeholder. Using local smart fallback.")
+            return@withContext StoryTrackOutcome(
+                data = getLocalBackupStoryData(text, chapterTitle),
+                requestId = requestId,
+                geminiSuccess = false,
+                usedLocalFallback = true
+            )
         }
 
         val systemPrompt = """
@@ -112,20 +134,52 @@ class GeminiStoryTracker {
         )
 
         try {
-            val response = RetrofitClient.service.generateContent(apiKey, request)
+            val response = RetrofitClient.generateContentWithResilience(
+                apiKey = apiKey,
+                request = request,
+                operationName = "STORY_ANALYSIS",
+                manuscriptInputChars = text.length,
+                requestId = requestId
+            )
             val rawJson = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
             if (rawJson != null) {
                 val cleanedJson = rawJson.trim().removeSurrounding("```json", "```").trim()
                 Log.d(TAG, "Extracted Response JSON: $cleanedJson")
                 val adapter = RetrofitClient.moshiInstance.adapter(ExtractedStoryData::class.java)
-                return@withContext adapter.fromJson(cleanedJson) ?: getLocalBackupStoryData(text, chapterTitle)
+                val parsed = adapter.fromJson(cleanedJson)
+                if (parsed != null) {
+                    return@withContext StoryTrackOutcome(
+                        data = parsed,
+                        requestId = requestId,
+                        geminiSuccess = true,
+                        usedLocalFallback = false
+                    )
+                } else {
+                    Log.w(TAG, "Parsed null story data from Gemini JSON; falling back to local story tracker.")
+                    return@withContext StoryTrackOutcome(
+                        data = getLocalBackupStoryData(text, chapterTitle),
+                        requestId = requestId,
+                        geminiSuccess = false,
+                        usedLocalFallback = true
+                    )
+                }
             } else {
-                Log.w(TAG, "Empty content returned from Gemini.")
-                return@withContext getLocalBackupStoryData(text, chapterTitle)
+                Log.w(TAG, "Empty content returned from Gemini; falling back to local story tracker.")
+                return@withContext StoryTrackOutcome(
+                    data = getLocalBackupStoryData(text, chapterTitle),
+                    requestId = requestId,
+                    geminiSuccess = false,
+                    usedLocalFallback = true
+                )
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Gemini story extraction failed: ${e.message}", e)
-            return@withContext getLocalBackupStoryData(text, chapterTitle)
+            Log.w(TAG, "Gemini story extraction temporarily unavailable (${e.message}); falling back to local story tracker.")
+            return@withContext StoryTrackOutcome(
+                data = getLocalBackupStoryData(text, chapterTitle),
+                requestId = requestId,
+                geminiSuccess = false,
+                usedLocalFallback = true
+            )
         }
     }
 

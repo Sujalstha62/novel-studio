@@ -1443,6 +1443,13 @@ fun NovelEditorScreen(viewModel: NovelViewModel) {
                                             Spacer(modifier = Modifier.height(4.dp))
                                         }
 
+                                        LaunchedEffect(grammarSuggestions.size) {
+                                            android.util.Log.i(
+                                                "NovelEditorScreen",
+                                                "Grammar pipeline counts: UI displayed count=${grammarSuggestions.size}"
+                                            )
+                                        }
+
                                         if (grammarSuggestions.isEmpty()) {
                                             Text(
                                                 text = "No grammar issues found. Tap Check to scan your text using Gemini.",
